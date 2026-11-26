@@ -1,0 +1,2166 @@
+Aqui está a implementação completa em **Kotlin + OpenGL ES 2.0** pronta para você colocar no seu projeto do **Android Studio**.
+
+Ela resolve os três pontos juntos:
+1. **`StaticSceneBatcher.kt`:** agrupa centenas de tufos de capim, pedras, cercas e degraus em **pouquíssimos VBOs/IBOs dentro do `onSurfaceCreated`**, respeitando o limite de `GL_UNSIGNED_SHORT` (65.535 vértices) do GLES 2.0 para manter **60 FPS estáveis**.
+2. **`AnimeTextureAtlas.kt`:** cria **um único Texture Atlas 512×512 (Power-of-Two + Mipmaps)** na memória ao iniciar, com olhos anime detalhados, dobras de roupa pintadas, couro, madeira e folha de grama — economizando memória e eliminando trocas pesadas de textura.
+3. **Aprimoramento de Design (Herói, NPCs, Vilões) + `SmoothNormalBaker`:** guia prático de silhueta/proporção anime estilo *Naruto Storm* e cálculo de **normais suavizadas** para o contorno preto (`GL_FRONT`) nunca abrir frestas nas quinas.
+
+---
+
+### 1. Static Batching no `onSurfaceCreated` (`StaticSceneBatcher.kt`)
+
+No OpenGL ES 2.0, desenhar 400 tufos de capim e 80 pedras com chamadas separadas derruba o FPS no celular. Este *batcher* junta tudo em **1 VBO + 1 IBO por lote** (dividindo automaticamente se passar de 60.000 vértices, porque GLES 2.0 padrão só garante índices `Short`).
+
+Além disso, ele grava **cor por vértice (`aVertexColor`)**: a base da grama e das pedras fica mais escura (simulação de *Ambient Occlusion* de contato com o chão) e as pontas ficam mais claras ao sol — exatamente o truque visual usado nos cenários do *Storm*.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.opengl.GLES20
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.random.Random
+
+/**
+ * Formato de vertice intercalado (11 floats = 44 bytes):
+ * pos(3) + normal(3) + uv(2) + vertexColor(3)
+ */
+class StaticSceneBatcher {
+
+    companion object {
+        const val FLOATS_PER_VERTEX = 11
+        const val STRIDE_BYTES = FLOATS_PER_VERTEX * 4
+        private const val MAX_VERTICES_PER_BATCH = 60_000
+    }
+
+    private data class GpuBatch(val vboId: Int, val iboId: Int, val indexCount: Int)
+
+    private val vertexBuilder = ArrayList<Float>(16_384)
+    private val indexBuilder = ArrayList<Short>(16_384)
+    private val gpuBatches = ArrayList<GpuBatch>()
+    private var currentVertexCount = 0
+
+    /**
+     * Chame dentro de GLSurfaceView.Renderer.onSurfaceCreated()
+     */
+    fun buildStaticSertaoProps(seed: Int = 42) {
+        release()
+        val rng = Random(seed)
+
+        // 1) Lote de Grama Estilizada (350 tufos em X cruzado nas bordas da trilha)
+        for (i in 0 until 350) {
+            val angle = rng.nextFloat() * 6.2831f
+            val dist = 3.2f + rng.nextFloat() * 32.0f
+            val gx = cos(angle) * dist
+            val gz = sin(angle) * dist
+            // Deixa o centro da trilha de terra livre
+            if (kotlin.math.abs(gx) < 2.2f && gz in -25f..25f) continue
+
+            val scale = 0.55f + rng.nextFloat() * 0.65f
+            val rotY = rng.nextFloat() * 3.1415f
+            val dryMix = rng.nextFloat()
+            val tipR = 0.48f + dryMix * 0.35f // Mistura verde vivo com capim dourado do sertao
+            val tipG = 0.78f - dryMix * 0.12f
+            val tipB = 0.22f
+            addCrossedGrassTuft(gx, 0.0f, gz, scale, rotY, tipR, tipG, tipB)
+        }
+
+        // 2) Lote de Rochas e Lajedos Estilizados (65 pedras)
+        for (i in 0 until 65) {
+            val rx = (rng.nextFloat() - 0.5f) * 68f
+            val rz = (rng.nextFloat() - 0.5f) * 68f
+            if (kotlin.math.abs(rx) < 3.0f && kotlin.math.abs(rz) < 12.0f) continue
+            val sx = 0.7f + rng.nextFloat() * 1.9f
+            val sy = 0.45f + rng.nextFloat() * 1.2f
+            val sz = 0.7f + rng.nextFloat() * 1.7f
+            addStylizedRock(rx, sy * 0.35f, rz, sx, sy, sz, rng.nextFloat() * 6.28f)
+        }
+
+        flushBatchToGpu()
+    }
+
+    private fun addCrossedGrassTuft(
+        x: Float, y: Float, z: Float,
+        scale: Float, rotY: Float,
+        tipR: Float, tipG: Float, tipB: Float
+    ) {
+        ensureCapacity(8)
+        val halfW = 0.36f * scale
+        val height = 0.62f * scale
+        val rootR = tipR * 0.38f
+        val rootG = tipG * 0.45f
+        val rootB = tipB * 0.38f
+
+        // 2 planos cruzados em 60 graus para volume 3D de qualquer angulo
+        for (plane in 0..1) {
+            val a = rotY + plane * 1.0472f
+            val dx = cos(a) * halfW
+            val dz = sin(a) * halfW
+            val baseIdx = currentVertexCount
+
+            // Regiao UV do capim no Atlas (quadrante inferior esquerdo: u 0.0..0.5, v 0.5..1.0)
+            pushVertex(x - dx, y, z - dz, 0f, 1f, 0f, 0.02f, 0.98f, rootR, rootG, rootB)
+            pushVertex(x + dx, y, z + dz, 0f, 1f, 0f, 0.48f, 0.98f, rootR, rootG, rootB)
+            pushVertex(x + dx * 1.15f, y + height, z + dz * 1.15f, 0f, 1f, 0f, 0.48f, 0.52f, tipR, tipG, tipB)
+            pushVertex(x - dx * 1.15f, y + height, z - dz * 1.15f, 0f, 1f, 0f, 0.02f, 0.52f, tipR, tipG, tipB)
+
+            pushTriangle(baseIdx, baseIdx + 1, baseIdx + 2)
+            pushTriangle(baseIdx, baseIdx + 2, baseIdx + 3)
+        }
+    }
+
+    private fun addStylizedRock(
+        cx: Float, cy: Float, cz: Float,
+        sx: Float, sy: Float, sz: Float, rotY: Float
+    ) {
+        // Prisma octogonal chanfrado (10 vertices, visual lapidado de anime)
+        ensureCapacity(24)
+        val c = cos(rotY)
+        val s = sin(rotY)
+
+        fun rot(px: Float, py: Float, pz: Float): FloatArray {
+            val wx = cx + (px * sx * c - pz * sz * s)
+            val wz = cz + (px * sx * s + pz * sz * c)
+            val wy = cy + py * sy
+            return floatArrayOf(wx, wy, wz)
+        }
+
+        val sides = 6
+        val topCenter = rot(0.08f, 0.55f, -0.05f)
+        val baseRing = Array(sides) { i ->
+            val a = i * (6.28318f / sides)
+            val jitter = if (i % 2 == 0) 0.52f else 0.42f
+            rot(cos(a) * jitter, -0.35f, sin(a) * jitter)
+        }
+        val midRing = Array(sides) { i ->
+            val a = i * (6.28318f / sides) + 0.18f
+            val jitter = if (i % 2 == 0) 0.36f else 0.44f
+            rot(cos(a) * jitter, 0.25f, sin(a) * jitter)
+        }
+
+        // Laterais e topo facetados com sombra de base mais escura
+        for (i in 0 until sides) {
+            val next = (i + 1) % sides
+            val b0 = baseRing[i]; val b1 = baseRing[next]
+            val m0 = midRing[i];  val m1 = midRing[next]
+            val nx = cos(i * (6.28318f / sides) + rotY)
+            val nz = sin(i * (6.28318f / sides) + rotY)
+
+            val idx = currentVertexCount
+            // UV da regiao de pedra no Atlas (u 0.52..0.98, v 0.52..0.98)
+            pushVertex(b0[0], b0[1], b0[2], nx, 0.25f, nz, 0.54f, 0.96f, 0.45f, 0.40f, 0.38f)
+            pushVertex(b1[0], b1[1], b1[2], nx, 0.25f, nz, 0.96f, 0.96f, 0.45f, 0.40f, 0.38f)
+            pushVertex(m1[0], m1[1], m1[2], nx, 0.55f, nz, 0.96f, 0.54f, 0.72f, 0.65f, 0.58f)
+            pushVertex(m0[0], m0[1], m0[2], nx, 0.55f, nz, 0.54f, 0.54f, 0.72f, 0.65f, 0.58f)
+            pushTriangle(idx, idx + 1, idx + 2)
+            pushTriangle(idx, idx + 2, idx + 3)
+
+            val topIdx = currentVertexCount
+            pushVertex(m0[0], m0[1], m0[2], 0f, 1f, 0f, 0.54f, 0.75f, 0.78f, 0.70f, 0.62f)
+            pushVertex(m1[0], m1[1], m1[2], 0f, 1f, 0f, 0.94f, 0.75f, 0.78f, 0.70f, 0.62f)
+            pushVertex(topCenter[0], topCenter[1], topCenter[2], 0f, 1f, 0f, 0.74f, 0.54f, 0.88f, 0.80f, 0.72f)
+            pushTriangle(topIdx, topIdx + 1, topIdx + 2)
+        }
+    }
+
+    private fun ensureCapacity(incomingVertices: Int) {
+        if (currentVertexCount + incomingVertices >= MAX_VERTICES_PER_BATCH) {
+            flushBatchToGpu()
+        }
+    }
+
+    private fun pushVertex(
+        x: Float, y: Float, z: Float,
+        nx: Float, ny: Float, nz: Float,
+        u: Float, v: Float,
+        r: Float, g: Float, b: Float
+    ) {
+        vertexBuilder.add(x); vertexBuilder.add(y); vertexBuilder.add(z)
+        vertexBuilder.add(nx); vertexBuilder.add(ny); vertexBuilder.add(nz)
+        vertexBuilder.add(u); vertexBuilder.add(v)
+        vertexBuilder.add(r); vertexBuilder.add(g); vertexBuilder.add(b)
+        currentVertexCount++
+    }
+
+    private fun pushTriangle(a: Int, b: Int, c: Int) {
+        indexBuilder.add(a.toShort())
+        indexBuilder.add(b.toShort())
+        indexBuilder.add(c.toShort())
+    }
+
+    private fun flushBatchToGpu() {
+        if (indexBuilder.isEmpty()) return
+
+        val vFloatArr = vertexBuilder.toFloatArray()
+        val vBuf = ByteBuffer.allocateDirect(vFloatArr.size * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+                put(vFloatArr); position(0)
+            }
+
+        val iShortArr = indexBuilder.toShortArray()
+        val iBuf = ByteBuffer.allocateDirect(iShortArr.size * 2)
+            .order(ByteOrder.nativeOrder()).asShortBuffer().apply {
+                put(iShortArr); position(0)
+            }
+
+        val ids = IntArray(2)
+        GLES20.glGenBuffers(2, ids, 0)
+
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, ids[0])
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, vFloatArr.size * 4, vBuf, GLES20.GL_STATIC_DRAW)
+
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ids[1])
+        GLES20.glBufferData(GLES20.GL_ELEMENT_ARRAY_BUFFER, iShortArr.size * 2, iBuf, GLES20.GL_STATIC_DRAW)
+
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+
+        gpuBatches.add(GpuBatch(ids[0], ids[1], iShortArr.size))
+        vertexBuilder.clear()
+        indexBuilder.clear()
+        currentVertexCount = 0
+    }
+
+    /**
+     * Chame em onDrawFrame() com 1 unica ligacao de textura (Atlas)
+     */
+    fun drawAll(posLoc: Int, normLoc: Int, uvLoc: Int, colorLoc: Int) {
+        for (batch in gpuBatches) {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, batch.vboId)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, batch.iboId)
+
+            GLES20.glEnableVertexAttribArray(posLoc)
+            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, STRIDE_BYTES, 0)
+
+            GLES20.glEnableVertexAttribArray(normLoc)
+            GLES20.glVertexAttribPointer(normLoc, 3, GLES20.GL_FLOAT, false, STRIDE_BYTES, 12)
+
+            GLES20.glEnableVertexAttribArray(uvLoc)
+            GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, STRIDE_BYTES, 24)
+
+            GLES20.glEnableVertexAttribArray(colorLoc)
+            GLES20.glVertexAttribPointer(colorLoc, 3, GLES20.GL_FLOAT, false, STRIDE_BYTES, 32)
+
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, batch.indexCount, GLES20.GL_UNSIGNED_SHORT, 0)
+        }
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+    }
+
+    fun release() {
+        if (gpuBatches.isNotEmpty()) {
+            val ids = IntArray(gpuBatches.size * 2)
+            gpuBatches.forEachIndexed { idx, b ->
+                ids[idx * 2] = b.vboId
+                ids[idx * 2 + 1] = b.iboId
+            }
+            GLES20.glDeleteBuffers(ids.size, ids, 0)
+            gpuBatches.clear()
+        }
+        vertexBuilder.clear()
+        indexBuilder.clear()
+        currentVertexCount = 0
+    }
+}
+```
+> **Dica no shader de cenário:** para o capim usar recorte transparente da folha no Atlas sem custo de *Alpha Blending*, coloque no fragment shader do cenário: `if (tex.a < 0.45) discard;` *(Alpha Cutout — 100% ordenado e rápido no Android!)*.
+
+---
+
+### 2. Otimização de Texturas + Características de Personagens (`AnimeTextureAtlas.kt`)
+
+Em vez de criar 15 texturas diferentes para herói, mestre, moradores e inimigos, você gera **1 único Atlas 512×512 (Power-of-Two)** no `onSurfaceCreated` com **4 quadrantes fixos** e reutiliza o mesmo Atlas para o jogo inteiro:
+* **Quadrante Superior Esquerdo `(0..256, 0..256)`:** Rosto e Olhos Anime em camadas (íris colorida, pupila escura, dois brilhos brancos característicos de anime, sobrancelha marcada e versão "olho em brasa" para os Encantados da Sombra!).
+* **Quadrante Superior Direito `(256..512, 0..256)`:** Dobras de roupa e couro (traços escuros pintados de camisa, gibão, fivela dourada e bandagens).
+* **Quadrante Inferior Esquerdo `(0..256, 256..512)`:** Folhas de capim estilizadas com transparência (`Alpha`).
+* **Quadrante Inferior Direito `(256..512, 256..512)`:** Rocha rachada e terra batida pintada à mão.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.graphics.*
+import android.opengl.GLES20
+import android.opengl.GLUtils
+
+object AnimeTextureAtlas {
+
+    fun createAndUploadAtlas512(): Int {
+        val size = 512
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.TRANSPARENT)
+
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        // 1) QUADRANTE SUP. ESQ: Rosto + Olhos Anime (Herói em 0..128, Inimigo em 128..256)
+        drawAnimeEyePair(c, p, offsetX = 0f, irisColor = Color.rgb(215, 130, 30), scleraColor = Color.rgb(248, 245, 240))
+        drawAnimeEyePair(c, p, offsetX = 128f, irisColor = Color.rgb(255, 45, 30), scleraColor = Color.rgb(35, 22, 42))
+
+        // 2) QUADRANTE SUP. DIR: Tecido / Gibao com dobras pintadas (256..512, 0..256)
+        p.style = Paint.Style.FILL
+        p.color = Color.rgb(225, 220, 212) // Base neutra para multiplicar por uShirtColor
+        c.drawRect(256f, 0f, 512f, 256f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = Color.argb(95, 55, 38, 28) // Linhas de dobra estilo Naruto Storm
+        for (row in 0..5) {
+            val y = 32f + row * 38f
+            c.drawLine(275f, y, 490f, y + 14f, p)
+        }
+        // Costura clara da barra do gibao
+        p.color = Color.rgb(235, 195, 95)
+        p.strokeWidth = 6f
+        c.drawRect(262f, 6f, 506f, 250f, p)
+
+        // 3) QUADRANTE INF. ESQ: Capim em laminas com alpha (0..256, 256..512)
+        p.style = Paint.Style.FILL
+        p.color = Color.WHITE // Cor real vem do aVertexColor (verde/dourado)
+        val blades = floatArrayOf(0.18f, 0.34f, 0.50f, 0.67f, 0.84f)
+        for ((idx, bx) in blades.withIndex()) {
+            val baseX = bx * 256f
+            val tipOffset = (idx - 2) * 18f
+            val bladePath = Path().apply {
+                moveTo(baseX - 18f, 510f)
+                lineTo(baseX + tipOffset, 274f + (idx % 2) * 26f)
+                lineTo(baseX + 18f, 510f)
+                close()
+            }
+            c.drawPath(bladePath, p)
+        }
+
+        // 4) QUADRANTE INF. DIR: Rocha rachada estilo Storm (256..512, 256..512)
+        p.color = Color.rgb(205, 192, 178)
+        c.drawRect(256f, 256f, 512f, 512f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3.5f
+        p.color = Color.argb(110, 60, 45, 38)
+        c.drawLine(270f, 290f, 360f, 355f, p)
+        c.drawLine(360f, 355f, 330f, 440f, p)
+        c.drawLine(360f, 355f, 470f, 390f, p)
+        c.drawLine(410f, 265f, 455f, 340f, p)
+
+        val texIds = IntArray(1)
+        GLES20.glGenTextures(1, texIds, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+        bmp.recycle()
+        return texIds[0]
+    }
+
+    private fun drawAnimeEyePair(c: Canvas, p: Paint, offsetX: Float, irisColor: Int, scleraColor: Int) {
+        p.style = Paint.Style.FILL
+        p.color = Color.rgb(245, 212, 182) // Base pele neutra
+        c.drawRect(offsetX, 0f, offsetX + 128f, 256f, p)
+
+        for (eye in 0..1) {
+            val ex = offsetX + if (eye == 0) 34f else 94f
+            val ey = 120f
+            p.color = scleraColor
+            c.drawOval(ex - 16f, ey - 11f, ex + 16f, ey + 11f, p)
+            p.color = irisColor
+            c.drawCircle(ex, ey, 8.5f, p)
+            p.color = Color.BLACK
+            c.drawCircle(ex, ey, 4f, p)
+            // Brilho anime caracteristico
+            p.color = Color.WHITE
+            c.drawCircle(ex - 3f, ey - 3f, 2.4f, p)
+            // Cilios superiores grossos
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 4f
+            p.color = Color.rgb(25, 18, 16)
+            c.drawArc(ex - 17f, ey - 13f, ex + 17f, ey + 9f, 195f, 150f, false, p)
+            p.style = Paint.Style.FILL
+        }
+    }
+}
+```
+
+---
+
+### 3. Design de Personagens, NPCs e Vilões + Contorno Sem Frestas (`SmoothNormalBaker`)
+
+Para que seus personagens tenham **aparência de anime e não de boneco quadrado**, aplique este guia visual nas proporções e acessórios em código (ou nos `.vrm`/`.glb` feitos no Blender):
+
+#### A. Arquitetura Visual dos Tipos de Personagem (Mesma Base, Características Próprias)
+Crie um `data class CharacterVisualProfile` com as características que mudam **sem duplicar malha**:
+
+| Personagem | Proporção & Silhueta | Rosto, Cabelo & Acessórios | Paleta & Diferencial Gráfico |
+| :--- | :--- | :--- | :--- |
+| **Kauan (Herói)** | Escala `1.0x`, tronco afilado em "V", inclinação `15°` para frente ao correr. | Cabelo com **8–10 pontas cônicas** saindo abaixo de um **chapéu de couro aba quebrada** (com fivela dourada) + **cachecol/faixa** esvoaçando atrás com onda senoidal. | Gibão marrom-escuro com costura dourada, faixa laranja-brasa na cintura e **lâmina na bainha** com brilho quente. |
+| **Mestre Severino (Mentor)** | Escala `1.08x`, ombros largos, postura ereta. | **Barba longa em pontas** brancas, sobrancelha grossa, chapéu de couro de aba larga e **poncho/manto comprido** cobrindo um ombro. | Tons terrosos e vinho envelhecido; bordão/espada antiga presa às costas. |
+| **NPCs da Vila (Ferreiro, Moradores)** | Variação `0.92x` a `1.05x`. | Alternar entre **chapéu de palha**, **lenço na cabeça** ou cabelo preso; avental de couro no ferreiro; saia/vestido cônico nas moradoras. | Roupas em tons algodão cru, azul-índigo e ocre para destacar da terra batida. |
+| **Encantados da Sombra (Inimigos & Chefes)** | Braços `1.2x` mais longos, postura curvada em ataque. | **Olhos em brasa do quadrante 2 do Atlas** (desenhados com `uRimStrength = 0.9` / emissivo para brilhar no escuro!), **2 a 4 chifres/galhos de jurema retorcidos** e garras nas mãos. | Pele cinza-arroxeada pálida, contorno (`uOutlineColor`) roxo-escuro em vez de preto puro e sombra tingida fria. |
+
+#### B. Como Evitar Frestas no Contorno Preto (`SmoothNormalBaker.kt`)
+*Por que suas peças articuladas abrem rachaduras nos cantos ao usar `glCullFace(GL_FRONT)`?* Porque cada face do cubo/cilindro tem uma normal apontando para um lado diferente. Rode esta função **1 única vez** quando montar a malha do personagem e passe o array resultante para `aSmoothNormal` do `outline_shader.glsl`:
+
+```kotlin
+package com.cacadores.sertao.render
+
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+object SmoothNormalBaker {
+
+    /**
+     * Calcula normais suavizadas por posicao compartilhada (1x na inicializacao)
+     * para o passe glCullFace(GL_FRONT) extrudar sem abrir rachaduras nos cantos.
+     */
+    fun bake(positions: FloatArray, normals: FloatArray): FloatArray {
+        val count = positions.size / 3
+        val map = HashMap<Triple<Int, Int, Int>, FloatArray>(count)
+
+        for (i in 0 until count) {
+            val key = Triple(
+                (positions[i * 3] * 1000f).roundToInt(),
+                (positions[i * 3 + 1] * 1000f).roundToInt(),
+                (positions[i * 3 + 2] * 1000f).roundToInt()
+            )
+            val acc = map.getOrPut(key) { floatArrayOf(0f, 0f, 0f) }
+            acc[0] += normals[i * 3]
+            acc[1] += normals[i * 3 + 1]
+            acc[2] += normals[i * 3 + 2]
+        }
+
+        val out = FloatArray(positions.size)
+        for (i in 0 until count) {
+            val key = Triple(
+                (positions[i * 3] * 1000f).roundToInt(),
+                (positions[i * 3 + 1] * 1000f).roundToInt(),
+                (positions[i * 3 + 2] * 1000f).roundToInt()
+            )
+            val acc = map[key]!!
+            val len = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).coerceAtLeast(0.0001f)
+            out[i * 3] = acc[0] / len
+            out[i * 3 + 1] = acc[1] / len
+            out[i * 3 + 2] = acc[2] / len
+        }
+        return out
+    }
+}
+```
+
+---
+
+### 4. Como Ligar Tudo Dentro do Seu `GLSurfaceView.Renderer`
+
+No seu renderizador Android:
+1. **`onSurfaceCreated`:**
+   * Compile os shaders `toon_shader.glsl` e `outline_shader.glsl`.
+   * Chame `atlasTextureId = AnimeTextureAtlas.createAndUploadAtlas512()`.
+   * Chame `staticBatcher.buildStaticSertaoProps()` (agrupa toda a grama e rochas em VBOs únicos na GPU).
+2. **`onDrawFrame`:**
+   * **Passo 1:** Desenhe cúpula do céu e terreno texturizado.
+   * **Passo 2:** Vincule `atlasTextureId` **1 única vez** e chame `staticBatcher.drawAll(...)` (toda a vegetação e pedras da cena em poucos ciclos!).
+   * **Passo 3:** Desenhe os discos de sombra no chão (`y = 0.03f`) sob Kauan, NPCs e Encantados.
+   * **Passo 4:** Desenhe os personagens com o `toon_shader` (com `GL_BACK` culling), e logo depois ligue `GLES20.glCullFace(GLES20.GL_FRONT)` para desenhar os mesmos personagens com `outline_shader` (usando `aSmoothNormal`), voltando para `GLES20.glCullFace(GLES20.GL_BACK)` ao final!
+
+Se você quiser, posso escrever agora a classe completa **`HumanoidAnimeMesh.kt`** com a geometria articulada de Kauan/Severino/Encantado (cabeça oval com plano de olhos UV, cabelo em mechas cônicas, tronco em V, antebraços, joelhos articulados, chapéu de couro e faixa dinâmica) já usando o `SmoothNormalBaker` e o `AnimeTextureAtlas`!
+Esta é a **Bíblia Visual Completa de Personagens, NPCs, Vilões e Equipamentos** de **A Lenda dos Caçadores do Sertão**.
+
+Ela foi pensada exatamente para dois usos simultâneos:
+1. Guiar a **modelagem em VRoid / Blender** (com *MToon*, *Spring Bones* e texturas pintadas) e a **geração de retratos** dos diálogos.
+2. Alimentar os perfis visuais do **motor 3D no Android** (paletas exatas, proporções e peças modulares), garantindo o visual nítido e estiloso do *NARUTO: Ultimate Ninja STORM* com identidade 100% original do Sertão.
+
+---
+
+### 1. Regras Gerais do Estilo Visual (Padrão *Anime Sertanejo*)
+
+* **Proporção dos Corpos (1:6.5 a 1:7):** Cabeça ligeiramente estilizada para leitura clara dos olhos, cintura fina em "V" nos guerreiros, ombros marcados e mãos/botas firmes para dar peso aos golpes.
+* **Regra da "Silhueta de Costas":** Como a câmera de exploração e luta fica atrás do protagonista, **todo personagem jogável precisa de movimento nas costas**: cachecol/faixa esvoaçante, ponta de poncho, fita de cabelo ou bainha em ângulo diagonal.
+* **Direção de Cor e Cel-Shading:**
+  * **Heróis e Povo:** Cores quentes e vivas (*Ouro Solar `#F2B705`*, *Laranja Brasa `#E85D1A`*, *Couro Curtiço `#6E3B23`*, *Algodão Cru `#EFE3C8`*) com sombras tingidas em vinho/marrom quente.
+  * **Vilões (*Encantados*):** Cores frias e contrastantes (*Cinza Pálido `#8E8A9C`*, *Roxo Abissal `#3A1F5D`*, *Carmesim Sombrio `#9E1B32`*) com olhos brilhantes para o jogador identificar ameaças instantaneamente até à noite.
+
+---
+
+### 2. Núcleo Principal (Herói e Família — Vila das Almas)
+
+#### Kauan (Protagonista — Padrão *Guardião da Chama*)
+* **Idade / Porte:** 17 anos, atlético, ágil, postura firme levemente inclinada para frente em guarda.
+* **Rosto e Cabelo:** Pele morena queimada de sol (`#D49A6A`), olhos grandes e expressivos cor de âmbar dourado (`#E59A24`) com sobrancelhas marcadas, pequena bandagem ou cicatriz discreta na bochecha esquerda. Cabelo preto-azulado em **mechas pontudas rebeldes** saindo por baixo do chapéu na nuca e na testa.
+* **Roupas e Acessórios:**
+  * **Cabeça:** Chapéu de couro de aba dianteira quebrada para cima (estilo vaqueiro jovem), com um **broche metálico de Sol em chamas** (relíquia de seu pai).
+  * **Pescoço (assinatura de costas):** **Faixa/cachecol comprido em Laranja Brasa com pontas desfiadas**, preso por um nó lateral, que ondula no vento durante corridas e saltos.
+  * **Tronco:** Gibão curto aberto de couro escuro (`#4A2818`) com costuras douradas pintadas nos ombros e barras, usado por cima de uma camisa de algodão cru sem mangas (deixando os antebraços livres com faixas enroladas nos pulsos).
+  * **Cintura e Pernas:** Cinturão duplo largo de couro com fivela de bronze, porta-cantil e bolsa de ervas/moedas no quadril direito; calça escura reforçada nos joelhos e **botas de cano médio com dobra e esporas estilizadas**.
+  * **Arma:** **Peixeira-Sabre "Brasa de Antônio"** — lâmina curva de aço escuro com sulcos gravados ao longo do fio que brilham em laranja-vivo ao carregar Energia. Bainha presa em diagonal nas costas ou no quadril esquerdo.
+* **Variações Customizáveis (Skins / Trajes de Loja e Missões):**
+  * *Início (Vila das Almas):* Camisa de algodão simples + chapéu de palha ou sem chapéu + peixeira de ferro comum (sem o gibão de Guardião).
+  * *Traje da Tempestade:* Colete azul-marinho com bordado de raios amarelos e bandana na testa.
+  * *Traje da Caatinga:* Gibão grosso completo com ombreiras de couro trançado e chapéu de couro fechado.
+  * *Traje do Eclipse (Final):* Manto escuro com forro dourado solar e chama viva na gola.
+
+#### Inaiá (Irmã Mais Nova — Vila das Almas)
+* **Porte:** 12 anos, pequena e expressiva.
+* **Visual:** Cabelo cacheado escuro dividido em **duas tranças compridas amarradas com fitas vermelhas**; olhos grandes castanho-claros; vestido simples de algodão creme com avental curto em tom terracota e bordado de flor de mandacaru na barra; sandálias de couro (alpercata) e um pequeno **patuá de madeira** pendurado no pescoço.
+
+#### Dona Socorro (Avó Curandeira)
+* **Porte:** Idosa baixa, postura serena.
+* **Visual:** Cabelo totalmente grisalho preso em coque firme com um **pente de madeira esculpida**; rosto gentil com rugas suaves de expressão; xale de renda branca de bilro sobre vestido longo verde-folha seco (`#4F6342`); carrega uma bolsa lateral de pano cheia de raízes e frascos de vidro.
+
+---
+
+### 3. Mestres, Aliados e Rival (*Ordem dos Guardiões da Chama*)
+
+#### Mestre Severino (Mentor — *Estilo da Chama*)
+* **Idade / Porte:** 58 anos, alto (`1.08x`), ombros largos e presença imponente.
+* **Rosto:** Pele curtida pelo sol, **barba branca comprida em pontas estilizadas** e bigode espesso; uma cicatriz vertical atravessando a sobrancelha direita; olhar severo, porém protetor.
+* **Roupas e Arma:**
+  * Chapéu de couro de aba larga bem gasto e marcado por cortes antigos.
+  * **Poncho/manto comprido em vermelho-vinho envelhecido (`#6E1E24`)** jogado sobre o ombro esquerdo, deixando o braço direito livre.
+  * Por baixo, gibão negro reforçado com pequenas chapas de latão escurecido no peito, faixa de tecido branco na cintura e botas pesadas.
+  * **Arma:** **Espadão do Guardião ("Fogueira Antiga")**, lâmina larga e pesada presa às costas com uma corrente curta no punho.
+
+#### Tainá (Aliada Jogável — *Estilo das Águas*)
+* **Idade / Porte:** 18 anos, esguia e muito ágil.
+* **Rosto e Cabelo:** Pele clara bronzeada, olhos azul-acinzentados tranquilos; cabelo escuro com reflexo azul-petróleo preso num **rabo de cavalo altíssimo com uma fita longa branca-celeste** que acompanha seus giros.
+* **Roupas e Arma:**
+  * Túnica leve de mangas médias amarradas com tiras nos antebraços (visual inspirado na mistura de blusa sertaneja com corte fluido de anime), em **azul-índigo (`#224B6E`) e branco**, cinto de corda trançada azul com pingente de gota de cristal.
+  * Calça-saia fluida (*pantalona larga* presa nos tornozelos) permitindo saltos e esquivas rápidas.
+  * **Arma:** **Sabre Fino "Cheia do Rio"**, lâmina prateada estreita e elegante com guarda em formato de onda.
+
+#### Bento (Aliado / Ferreiro de Combate — *Estilo da Caatinga*)
+* **Idade / Porte:** 24 anos, musculoso e largo (`1.12x`), o "tanque" do grupo.
+* **Rosto e Cabelo:** Cabelo castanho curto bem espetado, bandana grossa de pano marrom na testa, sorriso confiante e marcas antigas de faíscas de forja nos braços.
+* **Roupas e Arma:**
+  * Sem camisa por baixo (ou camisa regata escura rasgada) vestindo um **avental pesado de couro cru** preso por fivelas cruzadas no peito e uma **ombreira assimétrica de ferro martelado** no ombro esquerdo com cravos curtos (lembrando espinhos de mandacaru).
+  * Braçadeiras de couro grosso com tiras de metal.
+  * **Armas:** **Duas Peixeiras Largas Serrilhadas ("Garras de Jurema")** — uma em cada mão, com cabos enrolados em pano rústico.
+
+#### Mateus (Rival — *Estilo da Tempestade*)
+* **Idade / Porte:** 18 anos, postura altiva e olhar desafiador.
+* **Rosto e Cabelo:** Pele clara, cabelo preto liso-espetado com **franja longa caindo sobre o olho esquerdo**; olhos cinza-dourados frios.
+* **Roupas e Arma:**
+  * **Jaqueta curta de gola alta erguida** (clássica de rival estilo *Storm*!) em azul-noite (`#19223B`) com detalhes geométricos em **amarelo-relâmpago (`#F7C625`)** nas mangas e costas.
+  * Sem chapéu; luvas pretas sem dedos; calça justa dentro de botas altas limpas.
+  * **Arma:** **Sabre Reto Dourado ("Trovão Seco")**, bainha envernizada preta presa na lateral esquerda para saque ultrarrápido (*iaijutsu*).
+
+---
+
+### 4. NPCs das Vilas e Feiras (Para Popular o Mundo com Variedade)
+
+Para os NPCs não parecerem todos iguais, use **3 perfis base combináveis**:
+
+* **Seu Joaquim — Mercador de Armas e Armaduras (Feira de Pedra Branca / Vila):**
+  * Barriga saliente simpática, bigode grande curvado, **chapéu de palha de aba larga com fita xadrez**, colete bege cheio de bolsos, camisa branca de mangas arregaçadas, óculos redondos pequenos e um baú/mostruário amarrado às costas ou ao lado da barraca.
+* **Mestre Zé da Bigorna — Ferreiro (Santa Esperança / Templo):**
+  * Barba curta preta manchada de fuligem, **óculos de solda/proteção na testa**, avental de couro queimado, luvas grossas e martelo pesado pendurado no cinto.
+* **Moradores, Vaqueiros e Crianças (Modular):**
+  * **Vaqueiros/Sentinelas:** Chapéu de couro ou palha, gibão claro sem adornos da Ordem, lenço no pescoço (vermelho, azul ou ocre) e calça de brim.
+  * **Moradoras da Vila:** Blusa ombro-a-ombro ou decote quadrado com renda branca, saia rodada longa em cores vivas (amarelo-girassol, azul-anil, rosa-flor de cacto), cabelo em trança lateral ou lenço amarrado.
+  * **Viajantes/Retirantes:** Trouxa de pano nas costas, chapéu simples, roupas em tons terrosos desbotados.
+
+---
+
+### 5. Vilões, Criaturas e Chefes (*Encantados da Sombra*)
+
+Todo Encantado tem **2 sinais visuais imediatos** para o jogador reconhecer como inimigo mesmo de longe: **pele/corpo com fendas brilhantes escuras** e **olhos luminosos em fenda**.
+
+#### A. Criaturas Comuns e Especiais (Inimigos de Região)
+1. **Espreitador da Sombra (Comum — Vila das Almas / Caatinga):**
+   * *Silhueta:* Humanoide esguio e corcunda, braços mais compridos que as pernas terminando em garras negras afiadas.
+   * *Aparência:* Pele cinza-carvão com textura rachada como **madeira seca de jurema queimada**; no lugar do rosto, uma **máscara natural de osso esbranquiçado rachado** com dois olhos em fenda vermelho-brasa.
+2. **Rasga-Mortalha (Rápida / Voadora — Serra dos Ventos / Cemitério):**
+   * *Silhueta:* Criatura alada inspirada na ave de mau agouro do folclore nordestino.
+   * *Aparência:* Corpo fino envolto em trapos negros que viram **asas esfarrapadas com pontas de pena e osso**; cabeça com bico fino pontiagudo branco e olhos amarelos brilhantes.
+3. **Bruto de Lajedo (Resistente — Engenho / Serra):**
+   * *Silhueta:* Grande (`1.35x`), ombros gigantes e postura pesada sem pescoço aparente.
+   * *Aparência:* Tronco e braços cobertos por **placas naturais de pedra cinza-escura**, com fissuras no peito deixando vazar luz roxa-violeta; ataca socando o chão.
+4. **Assombração do Véu (Especial — Cemitério das Sombras):**
+   * *Silhueta:* Vulto alto que flutua poucos centímetros acima do solo.
+   * *Aparência:* Mortalha longa esfarrapada em roxo-escuro e azul-frio, rosto coberto por véu translúcido com dois pontos brilhantes; segura uma **lamparina antiga de fogo frio roxo** presa por corrente para atacar à distância.
+
+#### B. Chefes de Capítulo e Chefe Final
+1. **O Moedor de Ossos (Chefe do Engenho Abandonado — Ato I):**
+   * *História visual:* Um antigo capataz cruel que se fundiu às ferragens do engenho por ambição.
+   * *Design:* Corpo enorme assimétrico (`1.5x`). Lado esquerdo usa restos de colete rasgado e chapéu roto manchado de fuligem; **o braço direito foi totalmente substituído por uma roda dentada enferrujada gigante com dentes afiados de ferro**; no centro do peito aberto brilha um **núcleo roxo pulsante** preso por correntes de ferro quente.
+2. **A Dama da Renda Negra (Chefe do Cemitério / Santa Esperança — Ato II):**
+   * *História visual:* Espírito vingativo nascido das lágrimas do Eclipse.
+   * *Design:* Vestido longo colonial vitoriano-sertanejo todo em preto, grafite e vinho-escuro com **rendas rasgadas que flutuam como tentáculos/lâminas** ao redor dela. Cabelo longo branco-azulado flutuante, pele de porcelana com rachaduras finas soltando fumaça negra e dois leques/adagas curvas de prata escura.
+3. **Coronel Umbra — *O Senhor do Eclipse* (Chefe Final — Fortaleza do Eclipse):**
+   * *Silhueta:* Imponente (`1.15x`), elegante e ameaçador como um grande vilão de anime.
+   * *Rosto e Cabelo:* Homem de aparência aristocrática pálida (`#C7C1CE`), **cabelo longo prateado-cinza** caindo sobre os ombros; lado esquerdo do rosto marcado por uma veia negra brilhando em violeta e olho direito dourado-frio.
+   * *Roupas:* **Sobretudo militar/coronelista longo em preto-obsidiana (`#12101A`)**, com ombreiras esculpidas em formato de **meia-lua/eclipse dourado oxidado**, botões metálicos e capa interna carmesim-roxa que se abre nas fases 2 e 3 da luta. Chapéu de abas rígidas escuras com o emblema do **Sol Eclipsado** na frente (que cai na Fase 2 da batalha!).
+   * *Arma:* **Sabre Negro "Ocaso"** — lâmina longa negra de fio violeta que, na Fase 2 e 3, se desfaz em chicotes de sombra sólida e raios carmesins.
+
+---
+
+### 6. Progressão Visual das Armas e Trajes (Para Loja e Missões)
+
+Quando o jogador comprar ou ganhar itens nas missões, o visual acompanha a força:
+
+| Tier | Arma (Visual na Mão e Bainha) | Traje / Armadura (Visual no Corpo) |
+| :--- | :--- | :--- |
+| **Tier 1 (Início)** | **Peixeira de Ferro Batido:** Cabo de madeira simples, lâmina cinza curta. | **Roupa da Vila:** Camisa de algodão cru, calça simples e alpercata. |
+| **Tier 2 (Pedra Branca)** | **Facão do Vaqueiro:** Guarda de latão em "S", lâmina mais longa polida. | **Gibão de Couro Curtido:** Colete de vaqueiro marrom com costuras reforçadas. |
+| **Tier 3 (Santa Esperança)** | **Sabre dos Guardiões:** Empunhadura envolta em faixa laranja, lâmina curva gravada. | **Uniforme da Ordem:** Gibão escuro detalhado + cachecol comprido + botas altas. |
+| **Tier 4 (Templo da Chama)** | **Lâmina Solar do Seridó:** Fio rubi/dourado brilhante com partículas constantes de brasa! | **Manto do Guardião Supremo:** Armadura leve nos ombros + capa com bordado de Sol em chamas. |
+
+---
+
+### 7. Como aplicar isso agora (no Android OpenGL ES ou no VRoid/Blender)
+
+* **Se for modelar em VRoid + Blender (para exportar `.vrm`/`.glb`):** Use esta lista como ficha de referência para montar 1 modelo base por categoria (Kauan, Severino, Tainá, Bento, Mateus, 2 NPCs e 3 Encantados) e ajustar os materiais no **MToon** com as cores exatas acima.
+* **Se for aplicar agora no seu motor Kotlin + GLES 2.0 no Android Studio:** Basta criar um `enum class CharacterOutfitType` (`HEROI_KAUAN`, `MESTRE_SEVERINO`, `MERCADOR`, `ESPREITADOR`, `CHEFE_MOEDOR`, `CORONEL_UMBRA`) e, dentro do seu `HumanoidAnimeMesh`, ativar ou desativar os blocos de acessórios (**chapéu quebrado vs. chapéu largo vs. chifres**, **cachecol vs. poncho**, **quadrante 1 vs. quadrante 2 de olhos no Atlas**) mantendo a mesma estrutura rápida de VBO!
+
+Se quiser, posso escrever agora a classe **`HumanoidAnimeMesh.kt` completa** já montando esses detalhes (cabeça oval com olhos UV do Atlas, cabelo em mechas cônicas, chapéu de couro, cachecol ondulando no vento, gibão, braços/pernas articulados e `SmoothNormalBaker`) para substituir de vez o boneco quadrado da sua captura de tela!
+Aqui está a **continuação completa com todos os arquivos faltantes** para você fechar o pacote gráfico **Estilo Anime (*NARUTO: Ultimate Ninja STORM*) + HUD/Controles Android** dentro do seu projeto do **Android Studio (Kotlin + Jetpack Compose + OpenGL ES 2.0)**.
+
+Este pacote entrega o que faltava para ligar o `StaticSceneBatcher` e o `AnimeTextureAtlas` da resposta anterior em um motor 3D completo e funcional:
+
+1. **`CharacterVisualProfile.kt`**: Perfis visuais prontos de **todos** os personagens, NPCs, criaturas, chefes e tiers de armas/trajes.
+2. **`HumanoidAnimeMesh.kt`**: Gerador de malha 3D articulada estilo anime (cabeça oval com plano dedicado de olhos do Atlas, mechas de cabelo em pontas, chapéus/chifres, cachecol/capa dinâmica, tronco em V, membros com joelhos/cotovelos, armas na mão + `SmoothNormalBaker` contra frestas).
+3. **`WorldSkyAndGroundRenderer.kt`**: Cúpula de céu azul/crepuscular/eclipse com gradiente e nuvens, silhuetas de serras ao fundo, chão texturizado com trilha + vila (casas de taipa, poço e escadarias) e **sombra projetada no chão** que encolhe nos saltos.
+4. **`SertaoGLRenderer.kt`**: O `GLSurfaceView.Renderer` completo unindo tudo (Céu → Chão/Vila → Static Batching de Capim/Rochas → Sombras → MToon 2-Tons + Rim + Olhos Emissivos → Contorno `GL_FRONT` → Câmera 3D de Ação e Câmera de Conversa frente a frente).
+5. **`StormControlsAndHUD.kt`**: Os componentes Compose que faltavam (**Barra Dourada de Chefe**, **Barra Superior de Patacas/Menu sem sobreposição**, **Joystick Virtual fluido** e **4 Botões Simples estilo *Storm***).
+
+---
+
+### 1. `CharacterVisualProfile.kt` (Todos os Heróis, NPCs, Vilões e Equipamentos)
+
+```kotlin
+package com.cacadores.sertao.render
+
+enum class HatStyle { NONE, BROKEN_BRIM, WIDE_BRIM, STRAW_HAT, BANDANA, ECLIPSE_HAT, HORNS }
+enum class BackStyle { NONE, FLOWING_SCARF, PONCHO, HIGH_COLLAR_CAPE, RAGGED_CAPE, RAGGED_WINGS }
+enum class WeaponStyle { NONE, PEIXEIRA, DUAL_PEIXEIRA, GREATSWORD, SABRE, LANTERN, GEAR_ARM, DARK_SABER }
+
+data class CharacterVisualProfile(
+    val id: String,
+    val displayName: String,
+    val scale: Float = 1.0f,
+    val skinColor: FloatArray,
+    val shirtColor: FloatArray,
+    val pantsColor: FloatArray,
+    val hairColor: FloatArray,
+    val hatColor: FloatArray,
+    val accentColor: FloatArray,   // Cachecol, faixa, capa ou brilho
+    val outlineColor: FloatArray = floatArrayOf(0.08f, 0.05f, 0.06f, 1f),
+    val hatStyle: HatStyle = HatStyle.NONE,
+    val backStyle: BackStyle = BackStyle.NONE,
+    val weaponStyle: WeaponStyle = WeaponStyle.PEIXEIRA,
+    val useDemonEyes: Boolean = false,
+    val emissiveStrength: Float = 0.0f, // > 0 faz olhos/lâmina/núcleo brilharem no escuro
+    val hasBeard: Boolean = false,
+    val shoulderWidthScale: Float = 1.0f,
+    val armLengthScale: Float = 1.0f
+)
+
+object SertaoCharacterCatalog {
+
+    fun heroKauan(weaponTier: Int = 1, armorTier: Int = 1): CharacterVisualProfile {
+        val armorShirt = when (armorTier) {
+            1 -> floatArrayOf(0.88f, 0.82f, 0.70f, 1f) // Algodao cru da vila
+            2 -> floatArrayOf(0.45f, 0.26f, 0.16f, 1f) // Gibao curtido
+            3 -> floatArrayOf(0.28f, 0.16f, 0.11f, 1f) // Uniforme da Ordem
+            else -> floatArrayOf(0.14f, 0.10f, 0.13f, 1f) // Manto Supremo
+        }
+        val bladeEmissive = if (weaponTier >= 3) 0.45f else 0.0f
+        return CharacterVisualProfile(
+            id = "kauan", displayName = "Kauan", scale = 1.0f,
+            skinColor = floatArrayOf(0.83f, 0.60f, 0.42f, 1f),
+            shirtColor = armorShirt,
+            pantsColor = floatArrayOf(0.16f, 0.14f, 0.17f, 1f),
+            hairColor = floatArrayOf(0.10f, 0.11f, 0.16f, 1f),
+            hatColor = floatArrayOf(0.43f, 0.24f, 0.14f, 1f),
+            accentColor = floatArrayOf(0.92f, 0.36f, 0.10f, 1f), // Cachecol Laranja Brasa
+            hatStyle = if (armorTier == 1) HatStyle.STRAW_HAT else HatStyle.BROKEN_BRIM,
+            backStyle = if (armorTier >= 2) BackStyle.FLOWING_SCARF else BackStyle.NONE,
+            weaponStyle = if (weaponTier >= 3) WeaponStyle.SABRE else WeaponStyle.PEIXEIRA,
+            emissiveStrength = bladeEmissive
+        )
+    }
+
+    val MESTRE_SEVERINO = CharacterVisualProfile(
+        id = "severino", displayName = "Mestre Severino", scale = 1.08f,
+        skinColor = floatArrayOf(0.76f, 0.54f, 0.38f, 1f),
+        shirtColor = floatArrayOf(0.20f, 0.16f, 0.15f, 1f),
+        pantsColor = floatArrayOf(0.14f, 0.12f, 0.12f, 1f),
+        hairColor = floatArrayOf(0.90f, 0.90f, 0.92f, 1f), // Cabelo e barba branca
+        hatColor = floatArrayOf(0.36f, 0.21f, 0.13f, 1f),
+        accentColor = floatArrayOf(0.46f, 0.12f, 0.15f, 1f), // Poncho vinho
+        hatStyle = HatStyle.WIDE_BRIM,
+        backStyle = BackStyle.PONCHO,
+        weaponStyle = WeaponStyle.GREATSWORD,
+        hasBeard = true,
+        shoulderWidthScale = 1.12f
+    )
+
+    val TAINA = CharacterVisualProfile(
+        id = "taina", displayName = "Tainá", scale = 0.96f,
+        skinColor = floatArrayOf(0.85f, 0.65f, 0.48f, 1f),
+        shirtColor = floatArrayOf(0.14f, 0.30f, 0.44f, 1f),
+        pantsColor = floatArrayOf(0.12f, 0.22f, 0.34f, 1f),
+        hairColor = floatArrayOf(0.08f, 0.20f, 0.28f, 1f),
+        hatColor = floatArrayOf(0.92f, 0.96f, 1.0f, 1f),
+        accentColor = floatArrayOf(0.75f, 0.92f, 1.0f, 1f),
+        hatStyle = HatStyle.NONE,
+        backStyle = BackStyle.FLOWING_SCARF,
+        weaponStyle = WeaponStyle.SABRE,
+        shoulderWidthScale = 0.88f
+    )
+
+    val BENTO = CharacterVisualProfile(
+        id = "bento", displayName = "Bento", scale = 1.12f,
+        skinColor = floatArrayOf(0.78f, 0.52f, 0.35f, 1f),
+        shirtColor = floatArrayOf(0.40f, 0.25f, 0.16f, 1f),
+        pantsColor = floatArrayOf(0.22f, 0.18f, 0.15f, 1f),
+        hairColor = floatArrayOf(0.24f, 0.14f, 0.09f, 1f),
+        hatColor = floatArrayOf(0.48f, 0.28f, 0.14f, 1f),
+        accentColor = floatArrayOf(0.55f, 0.55f, 0.58f, 1f),
+        hatStyle = HatStyle.BANDANA,
+        weaponStyle = WeaponStyle.DUAL_PEIXEIRA,
+        shoulderWidthScale = 1.24f
+    )
+
+    val MATEUS = CharacterVisualProfile(
+        id = "mateus", displayName = "Mateus", scale = 1.0f,
+        skinColor = floatArrayOf(0.90f, 0.73f, 0.60f, 1f),
+        shirtColor = floatArrayOf(0.10f, 0.14f, 0.24f, 1f),
+        pantsColor = floatArrayOf(0.10f, 0.11f, 0.16f, 1f),
+        hairColor = floatArrayOf(0.08f, 0.08f, 0.12f, 1f),
+        hatColor = floatArrayOf(0.96f, 0.78f, 0.15f, 1f),
+        accentColor = floatArrayOf(0.97f, 0.78f, 0.15f, 1f), // Amarelo Relampago
+        hatStyle = HatStyle.NONE,
+        backStyle = BackStyle.HIGH_COLLAR_CAPE,
+        weaponStyle = WeaponStyle.SABRE,
+        emissiveStrength = 0.3f
+    )
+
+    val MERCADOR_JOAQUIM = CharacterVisualProfile(
+        id = "joaquim", displayName = "Seu Joaquim", scale = 1.02f,
+        skinColor = floatArrayOf(0.84f, 0.64f, 0.48f, 1f),
+        shirtColor = floatArrayOf(0.86f, 0.80f, 0.64f, 1f),
+        pantsColor = floatArrayOf(0.32f, 0.26f, 0.20f, 1f),
+        hairColor = floatArrayOf(0.30f, 0.24f, 0.20f, 1f),
+        hatColor = floatArrayOf(0.84f, 0.72f, 0.42f, 1f),
+        accentColor = floatArrayOf(0.72f, 0.22f, 0.18f, 1f),
+        hatStyle = HatStyle.STRAW_HAT,
+        weaponStyle = WeaponStyle.NONE,
+        hasBeard = true,
+        shoulderWidthScale = 1.15f
+    )
+
+    // --- VILOES E CHEFES (ENCANTADOS DA SOMBRA) ---
+
+    val ESPREITADOR_COMUM = CharacterVisualProfile(
+        id = "espreitador_comum", displayName = "Espreitador da Sombra", scale = 0.98f,
+        skinColor = floatArrayOf(0.32f, 0.29f, 0.36f, 1f),
+        shirtColor = floatArrayOf(0.16f, 0.14f, 0.20f, 1f),
+        pantsColor = floatArrayOf(0.12f, 0.10f, 0.15f, 1f),
+        hairColor = floatArrayOf(0.85f, 0.82f, 0.78f, 1f), // Mascara de osso
+        hatColor = floatArrayOf(0.20f, 0.14f, 0.22f, 1f),
+        accentColor = floatArrayOf(0.95f, 0.20f, 0.18f, 1f),
+        outlineColor = floatArrayOf(0.18f, 0.05f, 0.24f, 1f),
+        hatStyle = HatStyle.HORNS,
+        backStyle = BackStyle.RAGGED_CAPE,
+        weaponStyle = WeaponStyle.NONE,
+        useDemonEyes = true,
+        emissiveStrength = 0.75f,
+        armLengthScale = 1.22f
+    )
+
+    val BRUTO_LAJEDO = CharacterVisualProfile(
+        id = "bruto_lajedo", displayName = "Bruto de Lajedo", scale = 1.32f,
+        skinColor = floatArrayOf(0.36f, 0.34f, 0.38f, 1f),
+        shirtColor = floatArrayOf(0.28f, 0.26f, 0.30f, 1f),
+        pantsColor = floatArrayOf(0.20f, 0.18f, 0.22f, 1f),
+        hairColor = floatArrayOf(0.22f, 0.20f, 0.24f, 1f),
+        hatColor = floatArrayOf(0.45f, 0.20f, 0.70f, 1f),
+        accentColor = floatArrayOf(0.62f, 0.25f, 0.95f, 1f),
+        outlineColor = floatArrayOf(0.12f, 0.04f, 0.20f, 1f),
+        hatStyle = HatStyle.HORNS,
+        weaponStyle = WeaponStyle.NONE,
+        useDemonEyes = true,
+        emissiveStrength = 0.85f,
+        shoulderWidthScale = 1.38f
+    )
+
+    val CHEFE_MOEDOR_OSSOS = CharacterVisualProfile(
+        id = "moedor_ossos", displayName = "O Moedor de Ossos", scale = 1.48f,
+        skinColor = floatArrayOf(0.42f, 0.38f, 0.44f, 1f),
+        shirtColor = floatArrayOf(0.22f, 0.15f, 0.15f, 1f),
+        pantsColor = floatArrayOf(0.14f, 0.12f, 0.14f, 1f),
+        hairColor = floatArrayOf(0.18f, 0.16f, 0.18f, 1f),
+        hatColor = floatArrayOf(0.20f, 0.16f, 0.18f, 1f),
+        accentColor = floatArrayOf(0.75f, 0.22f, 0.90f, 1f),
+        outlineColor = floatArrayOf(0.15f, 0.04f, 0.18f, 1f),
+        hatStyle = HatStyle.BROKEN_BRIM,
+        backStyle = BackStyle.RAGGED_CAPE,
+        weaponStyle = WeaponStyle.GEAR_ARM,
+        useDemonEyes = true,
+        emissiveStrength = 0.95f,
+        shoulderWidthScale = 1.30f
+    )
+
+    val CHEFE_CORONEL_UMBRA = CharacterVisualProfile(
+        id = "coronel_umbra", displayName = "Coronel Umbra", scale = 1.15f,
+        skinColor = floatArrayOf(0.78f, 0.76f, 0.82f, 1f),
+        shirtColor = floatArrayOf(0.08f, 0.07f, 0.11f, 1f),
+        pantsColor = floatArrayOf(0.07f, 0.06f, 0.10f, 1f),
+        hairColor = floatArrayOf(0.76f, 0.78f, 0.85f, 1f), // Prateado
+        hatColor = floatArrayOf(0.08f, 0.07f, 0.12f, 1f),
+        accentColor = floatArrayOf(0.68f, 0.14f, 0.36f, 1f), // Carmesim/Eclipse
+        outlineColor = floatArrayOf(0.16f, 0.03f, 0.22f, 1f),
+        hatStyle = HatStyle.ECLIPSE_HAT,
+        backStyle = BackStyle.HIGH_COLLAR_CAPE,
+        weaponStyle = WeaponStyle.DARK_SABER,
+        useDemonEyes = true,
+        emissiveStrength = 1.0f,
+        shoulderWidthScale = 1.14f
+    )
+}
+```
+
+---
+
+### 2. `HumanoidAnimeMesh.kt` (Geometria Articulada Anime + Cabelo + Chapéu + Cachecol + Arma)
+
+Gera malhas separadas por parte (`HEAD`, `TORSO`, `LEFT_ARM`, `RIGHT_ARM`, `LEFT_LEG`, `RIGHT_LEG`, `BACK_CLOTH`, `WEAPON`), já com **normais suavizadas via `SmoothNormalBaker`** e **UV mapeado exatamente nos quadrantes do `AnimeTextureAtlas`**.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.opengl.GLES20
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.cos
+import kotlin.math.sin
+
+class HumanoidAnimeMesh(val profile: CharacterVisualProfile) {
+
+    enum class BodyPart { HEAD, TORSO, LEFT_ARM, RIGHT_ARM, LEFT_LEG, RIGHT_LEG, BACK_CLOTH, WEAPON }
+
+    data class PartGpuBuffers(
+        val vboId: Int,
+        val iboId: Int,
+        val indexCount: Int,
+        val tintColor: FloatArray,
+        val useTexture: Float,
+        val emissive: Float
+    )
+
+    companion object {
+        // pos(3) + norm(3) + uv(2) + color(3) + smoothNorm(3) = 14 floats (56 bytes)
+        const val FLOATS_PER_VERTEX = 14
+        const val STRIDE_BYTES = FLOATS_PER_VERTEX * 4
+    }
+
+    val parts = HashMap<BodyPart, PartGpuBuffers>()
+
+    fun buildAndUpload() {
+        release()
+        buildHead()
+        buildTorso()
+        buildArm(isLeft = true)
+        buildArm(isLeft = false)
+        buildLeg(isLeft = true)
+        buildLeg(isLeft = false)
+        buildBackCloth()
+        buildWeapon()
+    }
+
+    private fun buildHead() {
+        val m = MeshAssembler()
+        // Cabeca oval estilizada + plano frontal de olhos mapeado no quadrante 1 ou 2 do Atlas
+        m.addEllipsoid(0f, 0.16f, 0f, 0.155f, 0.185f, 0.165f, 12, 10, profile.skinColor, 0.72f, 0.25f)
+        // Plano frontal de rosto/olhos (UV exata no Atlas)
+        val u0 = if (profile.useDemonEyes) 0.50f else 0.0f // 0..0.25 heroi, 0.25..0.50 demonio
+        val eyeUStart = if (profile.useDemonEyes) 0.26f else 0.01f
+        val eyeUEnd = if (profile.useDemonEyes) 0.49f else 0.24f
+        m.addCurvedFaceQuad(0f, 0.17f, 0.166f, 0.22f, 0.13f, eyeUStart, 0.08f, eyeUEnd, 0.36f, floatArrayOf(1f, 1f, 1f))
+
+        // Cabelo anime em pontas (franja + nuca + laterais)
+        for (i in 0 until 8) {
+            val angle = (i / 8f) * 6.2831f
+            val hx = sin(angle) * 0.13f
+            val hz = cos(angle) * 0.13f
+            val tiltOut = if (hz > 0.05f) 0.06f else 0.10f // Franja mais curta, nuca mais longa
+            m.addCone(hx, 0.24f, hz, 0.075f, 0.22f, hx * tiltOut * 6f, -0.15f, hz * tiltOut * 6f, profile.hairColor)
+        }
+        // Touca base do cabelo
+        m.addEllipsoid(0f, 0.22f, -0.02f, 0.168f, 0.145f, 0.175f, 10, 8, profile.hairColor, 0.75f, 0.22f)
+
+        // Barba pontuda (Mestre Severino / Mercador)
+        if (profile.hasBeard) {
+            m.addCone(0f, 0.05f, 0.14f, 0.085f, 0.18f, 0f, -0.22f, 0.04f, profile.hairColor)
+        }
+
+        // Chapeus / Chifres / Bandana
+        when (profile.hatStyle) {
+            HatStyle.BROKEN_BRIM, HatStyle.WIDE_BRIM, HatStyle.STRAW_HAT, HatStyle.ECLIPSE_HAT -> {
+                val brimRadius = when (profile.hatStyle) {
+                    HatStyle.WIDE_BRIM, HatStyle.STRAW_HAT -> 0.40f
+                    HatStyle.ECLIPSE_HAT -> 0.35f
+                    else -> 0.31f
+                }
+                // Aba do chapeu
+                m.addTaperedCylinder(0f, 0.31f, 0f, brimRadius * 0.92f, brimRadius, 0.028f, 14, profile.hatColor, 0.75f, 0.25f)
+                // Copa do chapeu
+                m.addTaperedCylinder(0f, 0.32f, 0f, 0.155f, 0.185f, 0.14f, 12, profile.hatColor, 0.75f, 0.25f)
+                // Aba dianteira quebrada para cima (estilo vaqueiro/heroi)
+                if (profile.hatStyle == HatStyle.BROKEN_BRIM) {
+                    m.addBox(0f, 0.36f, 0.22f, 0.18f, 0.08f, 0.03f, profile.hatColor)
+                    // Broche dourado da Ordem
+                    m.addBox(0f, 0.37f, 0.185f, 0.05f, 0.05f, 0.02f, floatArrayOf(0.98f, 0.80f, 0.20f, 1f))
+                }
+            }
+            HatStyle.BANDANA -> {
+                m.addTaperedCylinder(0f, 0.26f, 0f, 0.172f, 0.172f, 0.07f, 12, profile.hatColor, 0.75f, 0.25f)
+            }
+            HatStyle.HORNS -> {
+                m.addCone(-0.10f, 0.32f, 0.02f, 0.04f, 0.22f, -0.10f, 0.20f, 0.05f, profile.hatColor)
+                m.addCone(0.10f, 0.32f, 0.02f, 0.04f, 0.22f, 0.10f, 0.20f, 0.05f, profile.hatColor)
+            }
+            HatStyle.NONE -> {}
+        }
+
+        val eyeGlow = if (profile.useDemonEyes) profile.emissiveStrength else 0f
+        parts[BodyPart.HEAD] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 1.0f, eyeGlow)
+    }
+
+    private fun buildTorso() {
+        val m = MeshAssembler()
+        val sw = profile.shoulderWidthScale
+        // Tronco em "V" (ombros mais largos que a cintura)
+        m.addTaperedCylinder(0f, 0.02f, 0f, 0.23f * sw, 0.15f, 0.52f, 10, profile.shirtColor, 0.72f, 0.25f)
+        // Cinturao de couro com fivela
+        m.addTaperedCylinder(0f, 0.01f, 0f, 0.162f, 0.162f, 0.09f, 10, profile.hatColor, 0.72f, 0.25f)
+        m.addBox(0f, 0.04f, 0.165f, 0.08f, 0.06f, 0.03f, floatArrayOf(0.95f, 0.75f, 0.22f, 1f))
+        // Bainha diagonal nas costas
+        if (profile.weaponStyle != WeaponStyle.NONE) {
+            m.addTaperedCylinder(-0.04f, 0.10f, -0.17f, 0.025f, 0.025f, 0.65f, 6, floatArrayOf(0.18f, 0.12f, 0.10f, 1f), 0.72f, 0.25f)
+        }
+        parts[BodyPart.TORSO] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 1.0f, 0f)
+    }
+
+    private fun buildArm(isLeft: Boolean) {
+        val m = MeshAssembler()
+        val len = profile.armLengthScale
+        // Ombro arredondado
+        m.addEllipsoid(0f, -0.02f, 0f, 0.075f, 0.075f, 0.075f, 8, 6, profile.shirtColor, 0.72f, 0.25f)
+        // Braco superior
+        m.addTaperedCylinder(0f, -0.26f * len, 0f, 0.065f, 0.052f, 0.25f * len, 8, profile.shirtColor, 0.72f, 0.25f)
+        // Antebraco + faixa de pulso
+        m.addTaperedCylinder(0f, -0.50f * len, 0f, 0.052f, 0.042f, 0.24f * len, 8, profile.skinColor, 0.72f, 0.25f)
+        // Punho fechado
+        m.addEllipsoid(0f, -0.55f * len, 0.01f, 0.048f, 0.055f, 0.052f, 8, 6, profile.skinColor, 0.72f, 0.25f)
+        val part = if (isLeft) BodyPart.LEFT_ARM else BodyPart.RIGHT_ARM
+        parts[part] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 0.0f, 0f)
+    }
+
+    private fun buildLeg(isLeft: Boolean) {
+        val m = MeshAssembler()
+        // Coxa afilando para o joelho
+        m.addTaperedCylinder(0f, -0.34f, 0f, 0.088f, 0.068f, 0.36f, 8, profile.pantsColor, 0.72f, 0.25f)
+        // Canela / Bota de cano medio
+        m.addTaperedCylinder(0f, -0.70f, 0f, 0.072f, 0.055f, 0.36f, 8, profile.hatColor, 0.72f, 0.25f)
+        // Pe / Bota apontando para frente (+Z)
+        m.addBox(0f, -0.73f, 0.05f, 0.105f, 0.075f, 0.20f, profile.hatColor)
+        val part = if (isLeft) BodyPart.LEFT_LEG else BodyPart.RIGHT_LEG
+        parts[part] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 0.0f, 0f)
+    }
+
+    private fun buildBackCloth() {
+        if (profile.backStyle == BackStyle.NONE) return
+        val m = MeshAssembler()
+        when (profile.backStyle) {
+            BackStyle.FLOWING_SCARF -> {
+                // Anel no pescoco + duas pontas esvoacando atras (-Z)
+                m.addTaperedCylinder(0f, 0.0f, 0f, 0.14f, 0.15f, 0.09f, 10, profile.accentColor, 0.72f, 0.25f)
+                m.addBox(-0.04f, -0.22f, -0.24f, 0.11f, 0.48f, 0.025f, profile.accentColor)
+                m.addBox(0.05f, -0.18f, -0.21f, 0.09f, 0.40f, 0.025f, profile.accentColor)
+            }
+            BackStyle.PONCHO, BackStyle.HIGH_COLLAR_CAPE, BackStyle.RAGGED_CAPE, BackStyle.RAGGED_WINGS -> {
+                // Capa/Poncho largo caindo dos ombros
+                m.addBox(0f, -0.36f, -0.18f, 0.44f, 0.78f, 0.04f, profile.accentColor)
+                if (profile.backStyle == BackStyle.HIGH_COLLAR_CAPE) {
+                    m.addTaperedCylinder(0f, 0.04f, -0.02f, 0.19f, 0.16f, 0.14f, 10, profile.shirtColor, 0.72f, 0.25f)
+                }
+            }
+            BackStyle.NONE -> {}
+        }
+        parts[BodyPart.BACK_CLOTH] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 1.0f, 0f)
+    }
+
+    private fun buildWeapon() {
+        if (profile.weaponStyle == WeaponStyle.NONE) return
+        val m = MeshAssembler()
+        val steel = floatArrayOf(0.84f, 0.88f, 0.94f, 1f)
+        val darkSteel = floatArrayOf(0.18f, 0.14f, 0.26f, 1f)
+        val gold = floatArrayOf(0.95f, 0.76f, 0.22f, 1f)
+
+        when (profile.weaponStyle) {
+            WeaponStyle.PEIXEIRA, WeaponStyle.DUAL_PEIXEIRA, WeaponStyle.SABRE, WeaponStyle.DARK_SABER -> {
+                val bladeLen = if (profile.weaponStyle == WeaponStyle.SABRE || profile.weaponStyle == WeaponStyle.DARK_SABER) 0.92f else 0.65f
+                val bladeColor = if (profile.weaponStyle == WeaponStyle.DARK_SABER) darkSteel else steel
+                // Cabo e guarda
+                m.addBox(0f, 0f, -0.06f, 0.032f, 0.036f, 0.22f, floatArrayOf(0.28f, 0.16f, 0.10f, 1f))
+                m.addBox(0f, 0f, 0.06f, 0.11f, 0.03f, 0.025f, gold)
+                // Lamina apontando para frente (+Z) na mao
+                m.addBox(0f, 0f, 0.08f + bladeLen * 0.5f, 0.018f, 0.06f, bladeLen, bladeColor)
+                // Fio brilhante quando tiver emissive
+                if (profile.emissiveStrength > 0.1f) {
+                    m.addBox(0f, -0.025f, 0.08f + bladeLen * 0.5f, 0.022f, 0.018f, bladeLen, profile.accentColor)
+                }
+            }
+            WeaponStyle.GREATSWORD -> {
+                m.addBox(0f, 0f, 0.06f, 0.16f, 0.04f, 0.03f, gold)
+                m.addBox(0f, 0f, 0.68f, 0.03f, 0.12f, 1.18f, steel)
+            }
+            WeaponStyle.GEAR_ARM -> {
+                // Roda dentada de ferro do Moedor de Ossos
+                m.addTaperedCylinder(0f, -0.10f, 0.16f, 0.24f, 0.24f, 0.08f, 12, floatArrayOf(0.38f, 0.34f, 0.36f, 1f), 0.72f, 0.72f)
+            }
+            WeaponStyle.LANTERN -> {
+                m.addBox(0f, -0.15f, 0.15f, 0.12f, 0.18f, 0.12f, profile.accentColor)
+            }
+            WeaponStyle.NONE -> {}
+        }
+        parts[BodyPart.WEAPON] = m.uploadToGpu(floatArrayOf(1f, 1f, 1f, 1f), 0.0f, profile.emissiveStrength)
+    }
+
+    fun release() {
+        parts.values.forEach {
+            GLES20.glDeleteBuffers(2, intArrayOf(it.vboId, it.iboId), 0)
+        }
+        parts.clear()
+    }
+
+    /**
+     * Construtor interno com SmoothNormalBaker automatico
+     */
+    private class MeshAssembler {
+        private val pos = ArrayList<Float>()
+        private val norm = ArrayList<Float>()
+        private val uv = ArrayList<Float>()
+        private val col = ArrayList<Float>()
+        private val idx = ArrayList<Short>()
+        private var vCount = 0
+
+        fun addVert(x: Float, y: Float, z: Float, nx: Float, ny: Float, nz: Float, u: Float, v: Float, c: FloatArray, shade: Float = 1f) {
+            pos.add(x); pos.add(y); pos.add(z)
+            norm.add(nx); norm.add(ny); norm.add(nz)
+            uv.add(u); uv.add(v)
+            col.add(c[0] * shade); col.add(c[1] * shade); col.add(c[2] * shade)
+            vCount++
+        }
+
+        fun addTri(a: Int, b: Int, c: Int) {
+            idx.add(a.toShort()); idx.add(b.toShort()); idx.add(c.toShort())
+        }
+
+        fun addBox(cx: Float, cy: Float, cz: Float, sx: Float, sy: Float, sz: Float, c: FloatArray) {
+            val hx = sx * 0.5f; val hy = sy * 0.5f; val hz = sz * 0.5f
+            val faces = arrayOf(
+                floatArrayOf(0f, 0f, 1f, -hx, -hy, hz, hx, -hy, hz, hx, hy, hz, -hx, hy, hz),
+                floatArrayOf(0f, 0f, -1f, hx, -hy, -hz, -hx, -hy, -hz, -hx, hy, -hz, hx, hy, -hz),
+                floatArrayOf(1f, 0f, 0f, hx, -hy, hz, hx, -hy, -hz, hx, hy, -hz, hx, hy, hz),
+                floatArrayOf(-1f, 0f, 0f, -hx, -hy, -hz, -hx, -hy, hz, -hx, hy, hz, -hx, hy, -hz),
+                floatArrayOf(0f, 1f, 0f, -hx, hy, hz, hx, hy, hz, hx, hy, -hz, -hx, hy, -hz),
+                floatArrayOf(0f, -1f, 0f, -hx, -hy, -hz, hx, -hy, -hz, hx, -hy, hz, -hx, -hy, hz)
+            )
+            for (f in faces) {
+                val base = vCount
+                val shade = if (f[1] < -0.5f) 0.72f else 1.0f
+                addVert(cx + f[3], cy + f[4], cz + f[5], f[0], f[1], f[2], 0.55f, 0.45f, c, shade)
+                addVert(cx + f[6], cy + f[7], cz + f[8], f[0], f[1], f[2], 0.95f, 0.45f, c, shade)
+                addVert(cx + f[9], cy + f[10], cz + f[11], f[0], f[1], f[2], 0.95f, 0.05f, c, shade)
+                addVert(cx + f[12], cy + f[13], cz + f[14], f[0], f[1], f[2], 0.55f, 0.05f, c, shade)
+                addTri(base, base + 1, base + 2)
+                addTri(base, base + 2, base + 3)
+            }
+        }
+
+        fun addTaperedCylinder(cx: Float, cy: Float, cz: Float, topR: Float, botR: Float, h: Float, segs: Int, c: FloatArray, u: Float, v: Float) {
+            val baseStart = vCount
+            for (i in 0..segs) {
+                val a = (i.toFloat() / segs) * 6.28318f
+                val ca = cos(a); val sa = sin(a)
+                addVert(cx + ca * botR, cy, cz + sa * botR, ca, 0f, sa, u, v, c, 0.85f)
+                addVert(cx + ca * topR, cy + h, cz + sa * topR, ca, 0f, sa, u + 0.2f, v + 0.15f, c, 1.0f)
+            }
+            for (i in 0 until segs) {
+                val p0 = baseStart + i * 2
+                addTri(p0, p0 + 1, p0 + 3)
+                addTri(p0, p0 + 3, p0 + 2)
+            }
+        }
+
+        fun addCone(cx: Float, cy: Float, cz: Float, r: Float, h: Float, tx: Float, ty: Float, tz: Float, c: FloatArray) {
+            val segs = 6
+            val tipIdx = vCount
+            addVert(cx + tx, cy + h + ty, cz + tz, 0f, 1f, 0f, 0.72f, 0.25f, c, 1.05f)
+            val ringStart = vCount
+            for (i in 0..segs) {
+                val a = (i.toFloat() / segs) * 6.28318f
+                val ca = cos(a); val sa = sin(a)
+                addVert(cx + ca * r, cy, cz + sa * r, ca, 0.2f, sa, 0.72f, 0.25f, c, 0.82f)
+            }
+            for (i in 0 until segs) {
+                addTri(tipIdx, ringStart + i, ringStart + i + 1)
+            }
+        }
+
+        fun addEllipsoid(cx: Float, cy: Float, cz: Float, rx: Float, ry: Float, rz: Float, slices: Int, stacks: Int, c: FloatArray, u: Float, v: Float) {
+            val start = vCount
+            for (st in 0..stacks) {
+                val phi = (st.toFloat() / stacks) * 3.14159f
+                val sp = sin(phi); val cp = cos(phi)
+                for (sl in 0..slices) {
+                    val theta = (sl.toFloat() / slices) * 6.28318f
+                    val nx = sp * cos(theta); val ny = cp; val nz = sp * sin(theta)
+                    addVert(cx + nx * rx, cy + ny * ry, cz + nz * rz, nx, ny, nz, u, v, c, if (ny < -0.3f) 0.85f else 1f)
+                }
+            }
+            val row = slices + 1
+            for (st in 0 until stacks) {
+                for (sl in 0 until slices) {
+                    val a = start + st * row + sl
+                    val b = a + row
+                    addTri(a, b, a + 1)
+                    addTri(b, b + 1, a + 1)
+                }
+            }
+        }
+
+        fun addCurvedFaceQuad(cx: Float, cy: Float, cz: Float, w: Float, h: Float, u0: Float, v0: Float, u1: Float, v1: Float, c: FloatArray) {
+            val base = vCount
+            val hw = w * 0.5f; val hh = h * 0.5f
+            addVert(cx - hw, cy - hh, cz - 0.015f, -0.25f, 0f, 0.96f, u0, v1, c)
+            addVert(cx + hw, cy - hh, cz - 0.015f, 0.25f, 0f, 0.96f, u1, v1, c)
+            addVert(cx + hw, cy + hh, cz - 0.015f, 0.25f, 0f, 0.96f, u1, v0, c)
+            addVert(cx - hw, cy + hh, cz - 0.015f, -0.25f, 0f, 0.96f, u0, v0, c)
+            addTri(base, base + 1, base + 2)
+            addTri(base, base + 2, base + 3)
+        }
+
+        fun uploadToGpu(tint: FloatArray, useTex: Float, emissive: Float): PartGpuBuffers {
+            val posArr = pos.toFloatArray()
+            val normArr = norm.toFloatArray()
+            val smoothArr = SmoothNormalBaker.bake(posArr, normArr)
+
+            val interleaved = FloatArray(vCount * FLOATS_PER_VERTEX)
+            for (i in 0 until vCount) {
+                val o = i * FLOATS_PER_VERTEX
+                interleaved[o + 0] = posArr[i * 3]
+                interleaved[o + 1] = posArr[i * 3 + 1]
+                interleaved[o + 2] = posArr[i * 3 + 2]
+                interleaved[o + 3] = normArr[i * 3]
+                interleaved[o + 4] = normArr[i * 3 + 1]
+                interleaved[o + 5] = normArr[i * 3 + 2]
+                interleaved[o + 6] = uv[i * 2]
+                interleaved[o + 7] = uv[i * 2 + 1]
+                interleaved[o + 8] = col[i * 3]
+                interleaved[o + 9] = col[i * 3 + 1]
+                interleaved[o + 10] = col[i * 3 + 2]
+                interleaved[o + 11] = smoothArr[i * 3]
+                interleaved[o + 12] = smoothArr[i * 3 + 1]
+                interleaved[o + 13] = smoothArr[i * 3 + 2]
+            }
+
+            val vBuf = ByteBuffer.allocateDirect(interleaved.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+                put(interleaved); position(0)
+            }
+            val iArr = idx.toShortArray()
+            val iBuf = ByteBuffer.allocateDirect(iArr.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer().apply {
+                put(iArr); position(0)
+            }
+
+            val ids = IntArray(2)
+            GLES20.glGenBuffers(2, ids, 0)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, ids[0])
+            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, interleaved.size * 4, vBuf, GLES20.GL_STATIC_DRAW)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ids[1])
+            GLES20.glBufferData(GLES20.GL_ELEMENT_ARRAY_BUFFER, iArr.size * 2, iBuf, GLES20.GL_STATIC_DRAW)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+
+            return PartGpuBuffers(ids[0], ids[1], iArr.size, tint, useTex, emissive)
+        }
+    }
+}
+```
+
+---
+
+### 3. `WorldSkyAndGroundRenderer.kt` (Céu, Nuvens, Serras, Chão Texturizado, Vila e Sombra no Solo)
+
+Substitui o fundo laranja vazio por **cúpula de céu azul vibrante com nuvens, montanhas no horizonte, trilha texturizada da Vila das Almas (poço de pedra, casas e degraus) e disco de sombra escura embaixo de cada personagem**.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.graphics.*
+import android.opengl.GLES20
+import android.opengl.GLUtils
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.cos
+import kotlin.math.sin
+
+class WorldSkyAndGroundRenderer {
+
+    private var skyVbo = 0; private var skyIbo = 0; private var skyCount = 0
+    private var groundVbo = 0; private var groundIbo = 0; private var groundCount = 0
+    private var villageVbo = 0; private var villageIbo = 0; private var villageCount = 0
+    private var shadowVbo = 0; private var shadowCount = 0
+    private var groundTexId = 0
+
+    fun init() {
+        groundTexId = createGroundTexture512()
+        buildSkyDomeAndSerras()
+        buildGroundPlane()
+        buildVilaDasAlmasStructures()
+        buildShadowDisc()
+    }
+
+    fun drawSky(mvpMatrix: FloatArray, posLoc: Int, colLoc: Int, uMvpLoc: Int) {
+        GLES20.glDepthMask(false)
+        GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, skyVbo)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, skyIbo)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 24, 0)
+        GLES20.glEnableVertexAttribArray(colLoc)
+        GLES20.glVertexAttribPointer(colLoc, 3, GLES20.GL_FLOAT, false, 24, 12)
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, skyCount, GLES20.GL_UNSIGNED_SHORT, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GLES20.glDepthMask(true)
+    }
+
+    fun drawGroundAndVillage(posLoc: Int, normLoc: Int, uvLoc: Int, colLoc: Int) {
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, groundTexId)
+        drawStridedBatch(groundVbo, groundIbo, groundCount, posLoc, normLoc, uvLoc, colLoc)
+        drawStridedBatch(villageVbo, villageIbo, villageCount, posLoc, normLoc, uvLoc, colLoc)
+    }
+
+    fun drawContactShadow(posLoc: Int) {
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, shadowVbo)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 12, 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_FAN, 0, shadowCount)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+    }
+
+    private fun drawStridedBatch(vbo: Int, ibo: Int, count: Int, posLoc: Int, normLoc: Int, uvLoc: Int, colLoc: Int) {
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vbo)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ibo)
+        GLES20.glEnableVertexAttribArray(posLoc)
+        GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 44, 0)
+        GLES20.glEnableVertexAttribArray(normLoc)
+        GLES20.glVertexAttribPointer(normLoc, 3, GLES20.GL_FLOAT, false, 44, 12)
+        GLES20.glEnableVertexAttribArray(uvLoc)
+        GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 44, 24)
+        GLES20.glEnableVertexAttribArray(colLoc)
+        GLES20.glVertexAttribPointer(colLoc, 3, GLES20.GL_FLOAT, false, 44, 32)
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, count, GLES20.GL_UNSIGNED_SHORT, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+    }
+
+    private fun createGroundTexture512(): Int {
+        val bmp = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        // Base verde-oliva/grama vibrante do sertao (combina com trilha por VertexColor)
+        c.drawColor(Color.rgb(162, 184, 108))
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        for (i in 0..220) {
+            val x = ((i * 73) % 512).toFloat()
+            val y = ((i * 137) % 512).toFloat()
+            p.color = if (i % 2 == 0) Color.argb(45, 110, 145, 65) else Color.argb(40, 215, 190, 125)
+            c.drawCircle(x, y, 8f + (i % 16), p)
+        }
+        val tex = IntArray(1)
+        GLES20.glGenTextures(1, tex, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_REPEAT)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_REPEAT)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+        bmp.recycle()
+        return tex[0]
+    }
+
+    private fun buildSkyDomeAndSerras() {
+        val verts = ArrayList<Float>()
+        val idx = ArrayList<Short>()
+        val stacks = 8; val slices = 18; val radius = 95f
+        for (st in 0..stacks) {
+            val t = st.toFloat() / stacks
+            val phi = t * 1.57f
+            val y = sin(phi) * radius - 4f
+            val r = cos(phi) * radius
+            // Gradiente de Ceu Azul Anime -> Horizonte Claro Dourado
+            val cr = 0.72f * (1f - t) + 0.24f * t
+            val cg = 0.86f * (1f - t) + 0.56f * t
+            val cb = 0.96f * (1f - t) + 0.92f * t
+            for (sl in 0..slices) {
+                val a = (sl.toFloat() / slices) * 6.28318f
+                verts.add(cos(a) * r); verts.add(y); verts.add(sin(a) * r)
+                verts.add(cr); verts.add(cg); verts.add(cb)
+            }
+        }
+        val row = slices + 1
+        for (st in 0 until stacks) {
+            for (sl in 0 until slices) {
+                val a = st * row + sl; val b = a + row
+                idx.add(a.toShort()); idx.add((a + 1).toShort()); idx.add(b.toShort())
+                idx.add(b.toShort()); idx.add((a + 1).toShort()); idx.add((b + 1).toShort())
+            }
+        }
+        // Anel de Serras distantes azuladas no horizonte
+        val baseRingStart = verts.size / 6
+        val mountainSlices = 24
+        for (i in 0..mountainSlices) {
+            val a = (i.toFloat() / mountainSlices) * 6.28318f
+            val x = cos(a) * 82f; val z = sin(a) * 82f
+            val peakH = 8f + (sin(i * 1.9f) * 0.5f + 0.5f) * 14f
+            verts.add(x); verts.add(-2f); verts.add(z); verts.add(0.42f); verts.add(0.54f); verts.add(0.70f)
+            verts.add(x); verts.add(peakH); verts.add(z); verts.add(0.56f); verts.add(0.70f); verts.add(0.84f)
+        }
+        for (i in 0 until mountainSlices) {
+            val p = baseRingStart + i * 2
+            idx.add(p.toShort()); idx.add((p + 2).toShort()); idx.add((p + 1).toShort())
+            idx.add((p + 1).toShort()); idx.add((p + 2).toShort()); idx.add((p + 3).toShort())
+        }
+
+        val pair = uploadSimple(verts.toFloatArray(), idx.toShortArray())
+        skyVbo = pair.first; skyIbo = pair.second; skyCount = idx.size
+    }
+
+    private fun buildGroundPlane() {
+        // Malha subdividida 16x16 para pintar a trilha de terra batida no centro
+        val grid = 16; val half = 48f
+        val v = ArrayList<Float>(); val idx = ArrayList<Short>()
+        for (z in 0..grid) {
+            for (x in 0..grid) {
+                val wx = -half + (x.toFloat() / grid) * (half * 2f)
+                val wz = -half + (z.toFloat() / grid) * (half * 2f)
+                val onRoad = kotlin.math.abs(wx) < 3.6f
+                val r = if (onRoad) 0.98f else 0.72f
+                val g = if (onRoad) 0.84f else 0.88f
+                val b = if (onRoad) 0.62f else 0.52f
+                v.add(wx); v.add(0f); v.add(wz); v.add(0f); v.add(1f); v.add(0f)
+                v.add(x * 1.5f); v.add(z * 1.5f); v.add(r); v.add(g); v.add(b)
+            }
+        }
+        val row = grid + 1
+        for (z in 0 until grid) {
+            for (x in 0 until grid) {
+                val a = z * row + x; val b = a + row
+                idx.add(a.toShort()); idx.add(b.toShort()); idx.add((a + 1).toShort())
+                idx.add(b.toShort()); idx.add((b + 1).toShort()); idx.add((a + 1).toShort())
+            }
+        }
+        val pair = uploadSimple(v.toFloatArray(), idx.toShortArray())
+        groundVbo = pair.first; groundIbo = pair.second; groundCount = idx.size
+    }
+
+    private fun buildVilaDasAlmasStructures() {
+        // Casas de taipa com telhado de barro + Poco central + Degraus (1 lote estatico!)
+        val v = ArrayList<Float>(); val idx = ArrayList<Short>()
+        fun addBox(cx: Float, cy: Float, cz: Float, sx: Float, sy: Float, sz: Float, r: Float, g: Float, b: Float) {
+            val hx = sx * 0.5f; val hy = sy * 0.5f; val hz = sz * 0.5f
+            val faces = arrayOf(
+                floatArrayOf(0f,0f,1f, -hx,-hy,hz, hx,-hy,hz, hx,hy,hz, -hx,hy,hz),
+                floatArrayOf(0f,0f,-1f, hx,-hy,-hz, -hx,-hy,-hz, -hx,hy,-hz, hx,hy,-hz),
+                floatArrayOf(1f,0f,0f, hx,-hy,hz, hx,-hy,-hz, hx,hy,-hz, hx,hy,hz),
+                floatArrayOf(-1f,0f,0f, -hx,-hy,-hz, -hx,-hy,hz, -hx,hy,hz, -hx,hy,-hz),
+                floatArrayOf(0f,1f,0f, -hx,hy,hz, hx,hy,hz, hx,hy,-hz, -hx,hy,-hz)
+            )
+            for (f in faces) {
+                val base = v.size / 11
+                for (k in 0..3) {
+                    v.add(cx + f[3 + k * 3]); v.add(cy + f[4 + k * 3]); v.add(cz + f[5 + k * 3])
+                    v.add(f[0]); v.add(f[1]); v.add(f[2]); v.add(0.5f); v.add(0.5f); v.add(r); v.add(g); v.add(b)
+                }
+                idx.add(base.toShort()); idx.add((base + 1).toShort()); idx.add((base + 2).toShort())
+                idx.add(base.toShort()); idx.add((base + 2).toShort()); idx.add((base + 3).toShort())
+            }
+        }
+        // Casa 1 e Casa 2 da Vila das Almas
+        addBox(-9f, 1.6f, -10f, 5.2f, 3.2f, 4.4f, 0.94f, 0.86f, 0.72f)
+        addBox(-9f, 3.55f, -10f, 5.8f, 0.7f, 5.0f, 0.68f, 0.28f, 0.16f)
+        addBox(9.5f, 1.6f, -14f, 5.6f, 3.2f, 4.6f, 0.92f, 0.84f, 0.70f)
+        addBox(9.5f, 3.55f, -14f, 6.2f, 0.7f, 5.2f, 0.66f, 0.26f, 0.16f)
+        // Poco central + Portal de entrada ao fundo
+        addBox(0f, 0.55f, -12f, 2.0f, 1.1f, 2.0f, 0.65f, 0.62f, 0.58f)
+        addBox(-1.9f, 2.2f, -20f, 0.55f, 4.4f, 0.55f, 0.45f, 0.24f, 0.14f)
+        addBox(1.9f, 2.2f, -20f, 0.55f, 4.4f, 0.55f, 0.45f, 0.24f, 0.14f)
+        addBox(0f, 4.2f, -20f, 5.2f, 0.5f, 0.65f, 0.58f, 0.22f, 0.14f)
+
+        val pair = uploadSimple(v.toFloatArray(), idx.toShortArray())
+        villageVbo = pair.first; villageIbo = pair.second; villageCount = idx.size
+    }
+
+    private fun buildShadowDisc() {
+        val segs = 14
+        val v = FloatArray((segs + 2) * 3)
+        v[0] = 0f; v[1] = 0f; v[2] = 0f
+        for (i in 0..segs) {
+            val a = (i.toFloat() / segs) * 6.28318f
+            v[(i + 1) * 3] = cos(a) * 0.55f
+            v[(i + 1) * 3 + 1] = 0f
+            v[(i + 1) * 3 + 2] = sin(a) * 0.55f
+        }
+        shadowCount = segs + 2
+        val buf = ByteBuffer.allocateDirect(v.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(v); position(0) }
+        val ids = IntArray(1)
+        GLES20.glGenBuffers(1, ids, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, ids[0])
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, v.size * 4, buf, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        shadowVbo = ids[0]
+    }
+
+    private fun uploadSimple(v: FloatArray, i: ShortArray): Pair<Int, Int> {
+        val vBuf = ByteBuffer.allocateDirect(v.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(v); position(0) }
+        val iBuf = ByteBuffer.allocateDirect(i.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer().apply { put(i); position(0) }
+        val ids = IntArray(2)
+        GLES20.glGenBuffers(2, ids, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, ids[0])
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, v.size * 4, vBuf, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ids[1])
+        GLES20.glBufferData(GLES20.GL_ELEMENT_ARRAY_BUFFER, i.size * 2, iBuf, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+        return ids[0] to ids[1]
+    }
+}
+```
+
+---
+
+### 4. `SertaoGLRenderer.kt` (O Motor 3D Completo Ligando Tudo)
+
+Integra no seu `GLSurfaceView`: **Céu → Chão + Vila → Static Batching de Grama/Rochas → Sombras no Solo → Personagens Cel-Shaded → Contorno Anime (`GL_FRONT`) → Animação articulada (inclinação de corrida, braços/pernas, cachecol ao vento e golpe de espada) + Câmera de Diálogo estilo Foto 3**.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.opengl.GLES20
+import android.opengl.GLSurfaceView
+import android.opengl.Matrix
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
+import kotlin.math.cos
+import kotlin.math.sin
+
+data class RenderActorState(
+    val id: String,
+    val x: Float, val y: Float, val z: Float,
+    val yawDeg: Float,
+    val speedRatio: Float, // 0f parado, 1f correndo
+    val attackAnim: Float  // 0f..1f durante golpe
+)
+
+class SertaoGLRenderer : GLSurfaceView.Renderer {
+
+    private val projMatrix = FloatArray(16)
+    private val viewMatrix = FloatArray(16)
+    private val modelMatrix = FloatArray(16)
+    private val mvpMatrix = FloatArray(16)
+
+    private var toonProg = 0
+    private var outlineProg = 0
+    private var unlitProg = 0
+    private var atlasTexId = 0
+
+    private val staticBatcher = StaticSceneBatcher()
+    private val worldRenderer = WorldSkyAndGroundRenderer()
+    private val actorMeshes = HashMap<String, HumanoidAnimeMesh>()
+
+    @Volatile var actors: List<RenderActorState> = emptyList()
+    @Volatile var isDialogueCamera: Boolean = false
+    @Volatile var dialogueTargetPos: FloatArray = floatArrayOf(0f, 1.3f, -5f)
+    @Volatile var camYawRad: Float = 0f
+    @Volatile var camPitchRad: Float = 0.28f
+
+    private var animTime = 0f
+
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        GLES20.glEnable(GLES20.GL_CULL_FACE)
+        GLES20.glCullFace(GLES20.GL_BACK)
+
+        toonProg = createProgram(TOON_VERT, TOON_FRAG)
+        outlineProg = createProgram(OUTLINE_VERT, OUTLINE_FRAG)
+        unlitProg = createProgram(UNLIT_VERT, UNLIT_FRAG)
+
+        atlasTexId = AnimeTextureAtlas.createAndUploadAtlas512()
+        staticBatcher.buildStaticSertaoProps()
+        worldRenderer.init()
+
+        // Cria malhas base prontas (pode expandir dinamicamente por regiao)
+        registerActor(SertaoCharacterCatalog.heroKauan(weaponTier = 2, armorTier = 2))
+        registerActor(SertaoCharacterCatalog.MESTRE_SEVERINO)
+        registerActor(SertaoCharacterCatalog.ESPREITADOR_COMUM)
+    }
+
+    fun registerActor(profile: CharacterVisualProfile) {
+        actorMeshes[profile.id]?.release()
+        val mesh = HumanoidAnimeMesh(profile)
+        mesh.buildAndUpload()
+        actorMeshes[profile.id] = mesh
+    }
+
+    override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        GLES20.glViewport(0, 0, width, height)
+        val ratio = width.toFloat() / height.coerceAtLeast(1)
+        Matrix.perspectiveM(projMatrix, 0, 50f, ratio, 0.2f, 150f)
+    }
+
+    override fun onDrawFrame(gl: GL10?) {
+        animTime += 0.016f
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+
+        val hero = actors.firstOrNull { it.id == "kauan" } ?: RenderActorState("kauan", 0f, 0f, 0f, 180f, 0f, 0f)
+        val camPos = updateCamera(hero)
+
+        // 1) Cupula de Ceu e Serras
+        GLES20.glUseProgram(unlitProg)
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, camPos[0], 0f, camPos[2])
+        multiplyMvp()
+        worldRenderer.drawSky(
+            mvpMatrix,
+            GLES20.glGetAttribLocation(unlitProg, "aPosition"),
+            GLES20.glGetAttribLocation(unlitProg, "aVertexColor"),
+            GLES20.glGetUniformLocation(unlitProg, "uMVPMatrix")
+        )
+
+        // 2) Cenario Cel-Shaded + Static Batching
+        GLES20.glUseProgram(toonProg)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(toonProg, "uTexture"), 0)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(toonProg, "uSunDir"), 0.55f, 0.78f, 0.42f)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(toonProg, "uCameraPos"), camPos[0], camPos[1], camPos[2])
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(toonProg, "uShadeTint"), 0.62f, 0.54f, 0.68f, 1f)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(toonProg, "uRimColor"), 1.0f, 0.92f, 0.76f)
+
+        Matrix.setIdentityM(modelMatrix, 0)
+        multiplyMvp()
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(toonProg, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(toonProg, "uModelMatrix"), 1, false, modelMatrix, 0)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(toonProg, "uBaseColor"), 1f, 1f, 1f, 1f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uUseTexture"), 1f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uAlphaCutoff"), 0.0f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uEmissive"), 0.0f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uRimStrength"), 0.0f)
+
+        val pLoc = GLES20.glGetAttribLocation(toonProg, "aPosition")
+        val nLoc = GLES20.glGetAttribLocation(toonProg, "aNormal")
+        val uLoc = GLES20.glGetAttribLocation(toonProg, "aTexCoord")
+        val cLoc = GLES20.glGetAttribLocation(toonProg, "aVertexColor")
+        worldRenderer.drawGroundAndVillage(pLoc, nLoc, uLoc, cLoc)
+
+        // Static Batching (Grama e Rochas com 1 unica ligacao de Atlas!)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, atlasTexId)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uAlphaCutoff"), 0.45f)
+        GLES20.glDisable(GLES20.GL_CULL_FACE) // Grama visivel dos dois lados
+        staticBatcher.drawAll(pLoc, nLoc, uLoc, cLoc)
+        GLES20.glEnable(GLES20.GL_CULL_FACE)
+
+        // 3) Sombras Projetadas no Chao sob cada personagem
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        GLES20.glDepthMask(false)
+        GLES20.glUseProgram(outlineProg)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(outlineProg, "uOutlineColor"), 0.06f, 0.04f, 0.08f, 0.42f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(outlineProg, "uOutlineWidth"), 0.0f)
+        for (actor in actors) {
+            val mesh = actorMeshes[actor.id] ?: continue
+            val jumpShrink = (1.0f - actor.y * 0.22f).coerceIn(0.45f, 1.0f) * mesh.profile.scale
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, actor.x, 0.03f, actor.z)
+            Matrix.scaleM(modelMatrix, 0, jumpShrink, 1f, jumpShrink)
+            multiplyMvp()
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(outlineProg, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+            worldRenderer.drawContactShadow(GLES20.glGetAttribLocation(outlineProg, "aPosition"))
+        }
+        GLES20.glDepthMask(true)
+        GLES20.glDisable(GLES20.GL_BLEND)
+
+        // 4) Personagens: Passe 1 (Cel-Shading MToon) + Passe 2 (Contorno Anime GL_FRONT)
+        for (actor in actors) {
+            val mesh = actorMeshes[actor.id] ?: continue
+            drawActorPass(actor, mesh, outlinePass = false, camPos = camPos)
+            drawActorPass(actor, mesh, outlinePass = true, camPos = camPos)
+        }
+    }
+
+    private fun drawActorPass(actor: RenderActorState, mesh: HumanoidAnimeMesh, outlinePass: Boolean, camPos: FloatArray) {
+        val prog = if (outlinePass) outlineProg else toonProg
+        GLES20.glUseProgram(prog)
+        if (outlinePass) {
+            GLES20.glCullFace(GLES20.GL_FRONT)
+            val oc = mesh.profile.outlineColor
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uOutlineColor"), oc[0], oc[1], oc[2], oc[3])
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uOutlineWidth"), 0.012f)
+        } else {
+            GLES20.glCullFace(GLES20.GL_BACK)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, atlasTexId)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uAlphaCutoff"), 0.0f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uRimStrength"), 0.42f)
+        }
+
+        val runSwing = sin(animTime * 10.5f) * 38f * actor.speedRatio
+        val runLean = 14f * actor.speedRatio // Inclinacao anime ao correr (estilo Storm!)
+        val slashAngle = sin(actor.attackAnim * 3.1415f) * 105f
+        val sc = mesh.profile.scale
+
+        for ((part, buf) in mesh.parts) {
+            Matrix.setIdentityM(modelMatrix, 0)
+            Matrix.translateM(modelMatrix, 0, actor.x, actor.y, actor.z)
+            Matrix.rotateM(modelMatrix, 0, actor.yawDeg, 0f, 1f, 0f)
+            Matrix.scaleM(modelMatrix, 0, sc, sc, sc)
+            Matrix.translateM(modelMatrix, 0, 0f, 0.78f, 0f) // Altura do quadril
+            Matrix.rotateM(modelMatrix, 0, runLean, 1f, 0f, 0f)
+
+            when (part) {
+                HumanoidAnimeMesh.BodyPart.TORSO -> {}
+                HumanoidAnimeMesh.BodyPart.HEAD -> Matrix.translateM(modelMatrix, 0, 0f, 0.54f, 0f)
+                HumanoidAnimeMesh.BodyPart.LEFT_ARM -> {
+                    Matrix.translateM(modelMatrix, 0, -0.27f * mesh.profile.shoulderWidthScale, 0.48f, 0f)
+                    Matrix.rotateM(modelMatrix, 0, runSwing, 1f, 0f, 0f)
+                }
+                HumanoidAnimeMesh.BodyPart.RIGHT_ARM -> {
+                    Matrix.translateM(modelMatrix, 0, 0.27f * mesh.profile.shoulderWidthScale, 0.48f, 0f)
+                    Matrix.rotateM(modelMatrix, 0, -runSwing - slashAngle, 1f, 0f, 0f)
+                }
+                HumanoidAnimeMesh.BodyPart.WEAPON -> {
+                    Matrix.translateM(modelMatrix, 0, 0.27f * mesh.profile.shoulderWidthScale, 0.48f, 0f)
+                    Matrix.rotateM(modelMatrix, 0, -runSwing - slashAngle, 1f, 0f, 0f)
+                    Matrix.translateM(modelMatrix, 0, 0f, -0.54f * mesh.profile.armLengthScale, 0.04f)
+                }
+                HumanoidAnimeMesh.BodyPart.LEFT_LEG -> Matrix.rotateM(modelMatrix, 0, -runSwing * 0.9f, 1f, 0f, 0f)
+                HumanoidAnimeMesh.BodyPart.RIGHT_LEG -> Matrix.rotateM(modelMatrix, 0, runSwing * 0.9f, 1f, 0f, 0f)
+                HumanoidAnimeMesh.BodyPart.BACK_CLOTH -> {
+                    Matrix.translateM(modelMatrix, 0, 0f, 0.48f, -0.02f)
+                    val flutter = 10f + actor.speedRatio * 28f + sin(animTime * 6f) * 8f
+                    Matrix.rotateM(modelMatrix, 0, flutter, 1f, 0f, 0f)
+                }
+            }
+
+            multiplyMvp()
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+            if (!outlinePass) {
+                GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModelMatrix"), 1, false, modelMatrix, 0)
+                GLES20.glUniform4fv(GLES20.glGetUniformLocation(prog, "uBaseColor"), 1, buf.tintColor, 0)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uUseTexture"), buf.useTexture)
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uEmissive"), buf.emissive)
+            }
+
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, buf.vboId)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, buf.iboId)
+
+            val stride = HumanoidAnimeMesh.STRIDE_BYTES
+            val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+            GLES20.glEnableVertexAttribArray(posLoc)
+            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, stride, 0)
+
+            if (outlinePass) {
+                val snLoc = GLES20.glGetAttribLocation(prog, "aSmoothNormal")
+                GLES20.glEnableVertexAttribArray(snLoc)
+                GLES20.glVertexAttribPointer(snLoc, 3, GLES20.GL_FLOAT, false, stride, 44)
+            } else {
+                val normLoc = GLES20.glGetAttribLocation(prog, "aNormal")
+                val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+                val colLoc = GLES20.glGetAttribLocation(prog, "aVertexColor")
+                GLES20.glEnableVertexAttribArray(normLoc); GLES20.glVertexAttribPointer(normLoc, 3, GLES20.GL_FLOAT, false, stride, 12)
+                GLES20.glEnableVertexAttribArray(uvLoc);   GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, stride, 24)
+                GLES20.glEnableVertexAttribArray(colLoc);  GLES20.glVertexAttribPointer(colLoc, 3, GLES20.GL_FLOAT, false, stride, 32)
+            }
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, buf.indexCount, GLES20.GL_UNSIGNED_SHORT, 0)
+        }
+        GLES20.glCullFace(GLES20.GL_BACK)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+    }
+
+    private fun updateCamera(hero: RenderActorState): FloatArray {
+        val camPos = FloatArray(3)
+        if (isDialogueCamera) {
+            // Enquadramento cinematografico de dialogo frente a frente (estilo Foto 3)
+            camPos[0] = hero.x + 1.8f
+            camPos[1] = hero.y + 1.65f
+            camPos[2] = hero.z + 2.4f
+            Matrix.setLookAtM(viewMatrix, 0, camPos[0], camPos[1], camPos[2], dialogueTargetPos[0], dialogueTargetPos[1], dialogueTargetPos[2], 0f, 1f, 0f)
+        } else {
+            val dist = 5.4f
+            camPos[0] = hero.x + sin(camYawRad) * cos(camPitchRad) * dist
+            camPos[1] = hero.y + 1.55f + sin(camPitchRad) * dist
+            camPos[2] = hero.z + cos(camYawRad) * cos(camPitchRad) * dist
+            Matrix.setLookAtM(viewMatrix, 0, camPos[0], camPos[1], camPos[2], hero.x, hero.y + 1.35f, hero.z, 0f, 1f, 0f)
+        }
+        return camPos
+    }
+
+    private fun multiplyMvp() {
+        val vm = FloatArray(16)
+        Matrix.multiplyMM(vm, 0, viewMatrix, 0, modelMatrix, 0)
+        Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, vm, 0)
+    }
+
+    private fun createProgram(vs: String, fs: String): Int {
+        val v = loadShader(GLES20.GL_VERTEX_SHADER, vs)
+        val f = loadShader(GLES20.GL_FRAGMENT_SHADER, fs)
+        return GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it, v)
+            GLES20.glAttachShader(it, f)
+            GLES20.glLinkProgram(it)
+        }
+    }
+
+    private fun loadShader(type: Int, src: String): Int =
+        GLES20.glCreateShader(type).also {
+            GLES20.glShaderSource(it, src)
+            GLES20.glCompileShader(it)
+        }
+
+    companion object {
+        private const val TOON_VERT = """
+            uniform mat4 uMVPMatrix; uniform mat4 uModelMatrix;
+            attribute vec3 aPosition; attribute vec3 aNormal; attribute vec2 aTexCoord; attribute vec3 aVertexColor;
+            varying vec3 vWorldPos; varying vec3 vNormal; varying vec2 vUv; varying vec3 vCol;
+            void main() {
+                vec4 wp = uModelMatrix * vec4(aPosition, 1.0);
+                vWorldPos = wp.xyz;
+                vNormal = normalize(mat3(uModelMatrix) * aNormal);
+                vUv = aTexCoord; vCol = aVertexColor;
+                gl_Position = uMVPMatrix * vec4(aPosition, 1.0);
+            }
+        """
+        private const val TOON_FRAG = """
+            precision mediump float;
+            uniform sampler2D uTexture; uniform vec4 uBaseColor; uniform vec4 uShadeTint;
+            uniform vec3 uSunDir; uniform vec3 uCameraPos; uniform vec3 uRimColor;
+            uniform float uRimStrength; uniform float uUseTexture; uniform float uAlphaCutoff; uniform float uEmissive;
+            varying vec3 vWorldPos; varying vec3 vNormal; varying vec2 vUv; varying vec3 vCol;
+            void main() {
+                vec4 tex = mix(vec4(1.0), texture2D(uTexture, vUv), uUseTexture);
+                if (uAlphaCutoff > 0.0 && tex.a < uAlphaCutoff) discard;
+                vec3 N = normalize(vNormal); vec3 L = normalize(uSunDir); vec3 V = normalize(uCameraPos - vWorldPos);
+                vec3 albedo = tex.rgb * uBaseColor.rgb * vCol;
+                float ndotl = dot(N, L);
+                float band = smoothstep(0.02, 0.09, ndotl);
+                vec3 lit = mix(albedo * uShadeTint.rgb, albedo * 1.08, band);
+                float rim = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 3.0) * smoothstep(0.0, 0.4, ndotl + 0.35);
+                // Neblina azulada de profundidade igual as fotos 2 e 3
+                float dist = length(uCameraPos - vWorldPos);
+                float fog = clamp((dist - 22.0) / 55.0, 0.0, 0.72);
+                vec3 col = lit + uRimColor * rim * uRimStrength + albedo * uEmissive;
+                gl_FragColor = vec4(mix(col, vec3(0.62, 0.78, 0.92), fog), 1.0);
+            }
+        """
+        private const val OUTLINE_VERT = """
+            uniform mat4 uMVPMatrix; uniform float uOutlineWidth;
+            attribute vec3 aPosition; attribute vec3 aSmoothNormal;
+            void main() {
+                vec4 cp = uMVPMatrix * vec4(aPosition, 1.0);
+                float s = clamp(cp.w * 0.14, 0.6, 2.2);
+                gl_Position = uMVPMatrix * vec4(aPosition + normalize(aSmoothNormal) * (uOutlineWidth * s), 1.0);
+            }
+        """
+        private const val OUTLINE_FRAG = """
+            precision mediump float; uniform vec4 uOutlineColor;
+            void main() { gl_FragColor = uOutlineColor; }
+        """
+        private const val UNLIT_VERT = """
+            uniform mat4 uMVPMatrix; attribute vec3 aPosition; attribute vec3 aVertexColor;
+            varying vec3 vCol;
+            void main() { vCol = aVertexColor; gl_Position = uMVPMatrix * vec4(aPosition, 1.0); }
+        """
+        private const val UNLIT_FRAG = """
+            precision mediump float; varying vec3 vCol;
+            void main() { gl_FragColor = vec4(vCol, 1.0); }
+        """
+    }
+}
+```
+
+---
+
+### 5. `StormControlsAndHUD.kt` (Os Componentes Faltantes de Jetpack Compose)
+
+Completa a interface horizontal estilo *NARUTO: Ultimate Ninja STORM*: **Barra Dourada do Chefe**, **Menu Superior de Patacas + Ícones sem sobreposição**, **Joystick Virtual fluido** e os **4 Botões Simples à Direita**.
+
+```kotlin
+package com.cacadores.sertao.ui.hud
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.CutCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+private val GoldBrush = Brush.linearGradient(
+    listOf(Color(0xFFFFE082), Color(0xFFD4A024), Color(0xFF8C5E14))
+)
+
+@Composable
+fun StormTopRightStrip(
+    patacas: Int,
+    onOpenInventory: () -> Unit,
+    onOpenShop: () -> Unit,
+    onSave: () -> Unit,
+    onPause: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.padding(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            color = Color(0xCC22160F),
+            shape = CutCornerShape(8.dp),
+            border = BorderStroke(1.5.dp, GoldBrush)
+        ) {
+            Text(
+                text = "◆ $patacas Patacas",
+                color = Color(0xFFFFD54F),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+            )
+        }
+        StormMiniIconButton("Mochila", onOpenInventory)
+        StormMiniIconButton("Loja", onOpenShop)
+        StormMiniIconButton("Salvar", onSave)
+        StormMiniIconButton("||", onPause)
+    }
+}
+
+@Composable
+private fun StormMiniIconButton(label: String, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = Color(0xCC1E140E),
+        shape = CircleShape,
+        border = BorderStroke(1.5.dp, GoldBrush),
+        modifier = Modifier.height(34.dp)
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 10.dp)) {
+            Text(label, color = Color(0xFFFFF8E1), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun StormBossBar(
+    bossName: String,
+    hp: Float,
+    maxHp: Float,
+    modifier: Modifier = Modifier
+) {
+    val progress = (hp / maxHp.coerceAtLeast(1f)).coerceIn(0f, 1f)
+    Column(modifier = modifier.width(320.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(bossName, color = Color(0xFFFFD54F), fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+        Spacer(Modifier.height(3.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(14.dp)
+                .clip(CutCornerShape(6.dp))
+                .background(Color(0xCC1A0E12))
+                .border(BorderStroke(1.5.dp, GoldBrush), CutCornerShape(6.dp))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(progress)
+                    .background(Brush.horizontalGradient(listOf(Color(0xFFB71C1C), Color(0xFFFF5252))))
+            )
+        }
+    }
+}
+
+@Composable
+fun StormVirtualJoystick(
+    onMove: (x: Float, y: Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val maxRadius = 56f
+    var knobOffset by remember { mutableStateOf(Offset.Zero) }
+
+    Box(
+        modifier = modifier
+            .size(132.dp)
+            .clip(CircleShape)
+            .background(Color(0x5518120E))
+            .border(BorderStroke(2.dp, GoldBrush), CircleShape)
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragEnd = {
+                        knobOffset = Offset.Zero
+                        onMove(0f, 0f)
+                    },
+                    onDragCancel = {
+                        knobOffset = Offset.Zero
+                        onMove(0f, 0f)
+                    },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        val next = knobOffset + dragAmount
+                        val dist = sqrt(next.x * next.x + next.y * next.y)
+                        knobOffset = if (dist > maxRadius) next * (maxRadius / dist) else next
+                        onMove(knobOffset.x / maxRadius, knobOffset.y / maxRadius)
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .offset { IntOffset(knobOffset.x.roundToInt(), knobOffset.y.roundToInt()) }
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(Color(0xCC3B2618))
+                .border(BorderStroke(2.dp, Color(0xFFFFD54F)), CircleShape)
+        )
+    }
+}
+
+@Composable
+fun StormCombatButtonsCluster(
+    showInteract: Boolean,
+    interactText: String,
+    onInteract: () -> Unit,
+    onAttack: () -> Unit,
+    onJumpOrDash: () -> Unit,
+    onSkillOrCharge: (isHolding: Boolean) -> Unit,
+    onBlockOrDodge: (isPressed: Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier = modifier.size(230.dp, 200.dp)) {
+        if (showInteract) {
+            Button(
+                onClick = onInteract,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD4A024)),
+                modifier = Modifier.align(Alignment.TopStart)
+            ) {
+                Text(interactText, color = Color(0xFF1A1008), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+        }
+
+        // Botao Tecnica / Segurar para Carregar Energia (Topo Direito do Arco)
+        StormActionCircle(
+            label = "CHAMA",
+            sizeDp = 56,
+            bgColor = Color(0xCCE65100),
+            onPressChange = onSkillOrCharge,
+            modifier = Modifier.align(Alignment.TopEnd).padding(end = 42.dp, top = 8.dp)
+        )
+
+        // Botao Defesa / Esquiva de Substituicao (Esquerda)
+        StormActionCircle(
+            label = "DEFESA",
+            sizeDp = 56,
+            bgColor = Color(0xCC263238),
+            onPressChange = onBlockOrDodge,
+            modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 18.dp)
+        )
+
+        // Botao Pulo / Arrancada (Canto Direito)
+        StormActionCircle(
+            label = "PULO",
+            sizeDp = 54,
+            bgColor = Color(0xCC0277BD),
+            onPressChange = { pressed -> if (pressed) onJumpOrDash() },
+            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)
+        )
+
+        // Botao Principal Grande de ATAQUE (Combo Automatico estilo Storm)
+        StormActionCircle(
+            label = "GOLPE",
+            sizeDp = 78,
+            bgColor = Color(0xDDB71C1C),
+            onPressChange = { pressed -> if (pressed) onAttack() },
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 10.dp)
+        )
+    }
+}
+
+@Composable
+private fun StormActionCircle(
+    label: String,
+    sizeDp: Int,
+    bgColor: Color,
+    onPressChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .size(sizeDp.dp)
+            .clip(CircleShape)
+            .background(bgColor)
+            .border(BorderStroke(2.5.dp, GoldBrush), CircleShape)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onPress = {
+                        onPressChange(true)
+                        tryAwaitRelease()
+                        onPressChange(false)
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+    }
+}
+```
+
+---
+
+### Checklist Final para Ligar Tudo na `MainActivity` / `GameScreen`
+
+1. Coloque os 5 arquivos no pacote `com.cacadores.sertao.render` (`StaticSceneBatcher.kt`, `AnimeTextureAtlas.kt`, `SmoothNormalBaker.kt`, `CharacterVisualProfile.kt`, `HumanoidAnimeMesh.kt`, `WorldSkyAndGroundRenderer.kt`, `SertaoGLRenderer.kt`) e os 2 arquivos Compose em `com.cacadores.sertao.ui.hud` (`StormHUD` + `StormControlsAndHUD.kt`).
+2. Na `MainActivity`, garanta `requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE` e `AndroidView(factory = { GLSurfaceView(it).apply { setEGLContextClientVersion(2); setRenderer(renderer) } })`.
+3. Passe o estado de movimento do `StormVirtualJoystick` para o seu `GameViewModel` atualizar a lista `renderer.actors` a 60Hz (e `renderer.isDialogueCamera = true` quando conversar com o Mestre Severino ou Seu Joaquim).
+4. Ao comprar armas/armaduras na Loja ou subir de tier nas missões, chame apenas `renderer.registerActor(SertaoCharacterCatalog.heroKauan(weaponTier, armorTier))` dentro da thread GL (`glSurfaceView.queueEvent { ... }`) — o visual do Kauan muda imediatamente no jogo!
+
+Se aparecer qualquer erro de import ou compilação ao colar esses arquivos no seu Android Studio, cole aqui a linha do erro que eu corrijo na hora.
+Aqui está o **Comando-Mestre de "Agente Jogador & QA Autônomo"** pronto para você colar na sua IA (dentro da pasta do seu projeto do Android Studio, ou no Gemini/Claude/Cursor conectado ao terminal).
+
+Ele transforma a IA em um **jogador + testador automático** que sobe o jogo no Emulador Android, joga simulando toques e entradas reais, lê os logs e prints de tela para achar falhas (visuais, de combate, de missão, loja, shader ou *crash*), corrige o código, limpa os dados e **recomeça do zero até conseguir zerar do início ao fim**.
+
+---
+
+### Copie e cole TUDO dentro deste bloco na sua IA:
+
+```markdown
+# MISSÃO: EMULAR UM JOGADOR REAL, JOGAR DO INÍCIO AO FIM, ENCONTRAR FALHAS, CORRIGIR E RECOMEÇAR ATÉ CONCLUIR O JOGO
+
+Assuma agora o papel de **Engenheiro de QA Autônomo + Jogador Simulado (Playtester)** para o projeto **A Lenda dos Caçadores do Sertão**.
+
+Seu objetivo NÃO é apenas ler o código: você deve **compilar, instalar, rodar o jogo de verdade, simular um jogador jogando da tela inicial até os créditos finais**, identificar qualquer falha funcional, gráfica, de áudio, de UI ou de progressão, **corrigir a causa raiz**, limpar o progresso e **recomeçar a partida do zero** até provar que o jogo é zerável do começo ao fim sem erros.
+
+---
+
+## REGRAS RÍGIDAS (PROIBIDO FINGIR TESTES)
+
+1. **Evidência Real Obrigatória:** Você só pode marcar uma etapa como "PASSOU" após executar o comando real no terminal e verificar a saída (exit code `0`, `adb logcat` limpo, resultados reais dos testes de UI/lógica e inspeção real de screenshots capturados do emulador).
+2. **Reinício Limpo Após Correção:** Sempre que corrigir um bug no código, recompile, limpe o estado salvo (`adb shell pm clear <applicationId>` ou reset de save de teste) e **recomece o ciclo do início** para garantir que a correção não quebrou etapas anteriores.
+3. **Sem Loop Infinito:** Se o mesmo erro persistir após **3 tentativas seguidas de correção**, PARE imediatamente, documente o erro exato do `logcat`/compilador e peça minha orientação (não queime recursos em loops cegos).
+4. **Detecção Automática da Plataforma:** No Passo 0, verifique se a pasta atual é o projeto **Android Studio (Gradle/Kotlin/GLES20)** ou **Godot 4**, e use os comandos correspondentes (priorizando Android + Emulador abaixo).
+
+---
+
+## FASE 0 — PREPARAR O CAMPO DE TESTES E SUBIR O JOGO
+
+1. Leia o diretório atual (`build.gradle*`, `AndroidManifest.xml`, `app/src/...`) e identifique o `applicationId` exato.
+2. Verifique emuladores e dispositivos conectados:
+   - Rode `adb devices`. Se não houver emulador aberto, liste os AVDs (`emulator -list-avds`) e inicie um em background (`emulator -avd <nome> -no-snapshot-load &`) aguardando `adb wait-for-device`.
+3. Rode a compilação e instalação reais:
+   - `./gradlew testDebugUnitTest assembleDebug installDebug`
+   - Se houver erro de compilação Kotlin, Jetpack Compose ou GLSL, corrija antes de seguir.
+4. Limpe dados antigos para simular um jogador novo (`adb shell pm clear <applicationId>`) e inicie o app (`adb shell monkey -p <applicationId> -c android.intent.category.LAUNCHER 1` ou `am start`).
+
+---
+
+## FASE 1 — EMULAR O JOGADOR EM DUAS CAMADAS (VISUAL REAL + CAMPANHA COMPLETA)
+
+Execute o ciclo completo usando **estas duas frentes juntas**:
+
+### Camada A — Jogador na Tela Real do Emulador (`adb` + `screencap` + `logcat`)
+Limpe o logcat (`adb logcat -c`) e jogue como um usuário humano na tela do celular, capturando prints (`adb exec-out screencap -p > qa_screen_<etapa>.png`) e inspecionando cada print para confirmar visualmente:
+1. **Orientação e Menu Inicial:**
+   - Confirme que a tela abriu **100% na Horizontal (`landscape`)** (largura > altura).
+   - Verifique o Menu Inicial em português (Novo Jogo, Continuar, Capítulos, Personagens, Configurações, Créditos).
+   - Toque em **Novo Jogo** via `adb shell input tap <x> <y>`.
+2. **HUD, Gráficos 3D e Sem Sobreposição:**
+   - Capture print dentro da **Vila das Almas** e verifique: céu/iluminação visível, chão texturizado, personagem humanoide anime com contorno sem frestas e sombra no chão, **zero botões sobrepondo barras de vida/XP/missão**, e texto 100% em português.
+3. **Simulação de Movimentação e Câmera:**
+   - Arraste o joystick virtual (`adb shell input swipe ...`) para andar/correr nas 4 direções.
+   - Toque em Pulo, Esquiva/Defesa e Ataque (`GOLPE` em sequência para disparar Combo e contador na tela) e Técnica (`CHAMA`).
+4. **Conversa 3D com NPC e Missão:**
+   - Aproxime-se do NPC (Mestre Severino), toque no botão de interação, verifique se a caixa de diálogo em pergaminho aparece com **retrato pequeno, nome e texto PT-BR**, avance todas as falas e confirme se a missão foi aceita e o áudio não gerou erro no `logcat`.
+5. **Combate, Patacas e Loja:**
+   - Ataque inimigos na área de teste até derrotar um, confirme ganho de **XP + Patacas** na HUD.
+   - Abra a **Loja**, compre uma arma/armadura/poção, confirme desconto das Patacas, equipamento ativo e atualização visual/atributos do herói.
+6. **Save, Fechamento e Load:**
+   - Salve manualmente (ou acione autosave), feche o app (`adb shell am force-stop <applicationId>`), reabra e clique em **Continuar**, confirmando que nível, Patacas, posição, itens e missões voltaram intactos.
+7. **Caça a Falhas no `logcat`:**
+   - Leia `adb logcat -d` filtrando por `AndroidRuntime`, `FATAL`, `ANR`, `GLES`, `OpenGL`, `Shader`, `Choreographer` (queda severa de frames) e `MediaPlayer`/`Audio`. Qualquer exceção ou erro de shader conta como FALHA a ser corrigida!
+
+### Camada B — Bot Jogador End-to-End (Simulação Completa dos 10 Capítulos até Zerar)
+Como uma campanha de 12–20h leva horas manualmente na tela, crie/execute uma suíte automatizada de **Playtest Bot (`FullCampaignPlaytestBotTest.kt` em `androidTest` ou `test` + `ComposeTestRule`)** que **instancia o `GameViewModel` / estado real do jogo** e joga sistematicamente **do início ao fim**, passo a passo:
+- **Região 1 (Vila das Almas)** → **Região 2 (Caatinga Profunda)** → **Região 3 (Serra dos Ventos)** → **Região 4 (Feira de Pedra Branca)** → **Região 5 (Engenho Abandonado + Chefe Moedor de Ossos)** → **Região 6 (Cemitério das Sombras + Estilo da Lua)** → **Região 7 (Fazenda dos Umbuzeiros)** → **Região 8 (Cidade de Santa Esperança)** → **Região 9 (Templo da Chama)** → **Região 10 (Fortaleza do Eclipse + Chefe Final Coronel Umbra em múltiplas fases)** → **Epílogo** → **Créditos Finais** → **Retorno ao Menu**.
+- O Bot deve validar matematicamente em CADA região/etapa:
+  1. Nenhuma missão fica impossível de completar (*softlock* de contagem ou NPC ausente).
+  2. Todos os 5 Estilos de Combate causam dano, consomem/regeneram Energia/Stamina corretamente e nunca deixam valores `NaN` ou negativos infinitos.
+  3. Toda compra na loja desconta Patacas corretamente (não permite saldo negativo) e itens recebidos de missões aparecem no inventário.
+  4. Todo chefe (incluindo transição de fases do Coronel Umbra) morre corretamente quando HP chega a `0` e desbloqueia a próxima região/epílogo.
+  5. Save/Load funciona em qualquer capítulo intermediário e após os Créditos Finais.
+
+---
+
+## FASE 2 — PROTOCOLO DE CORREÇÃO E RECOMEÇO (LOOP QA)
+
+Mantenha o arquivo **`docs/QA_PLAYTEST_LOG.md`** atualizado a cada rodada com:
+- `Rodada #`
+- `Etapa onde falhou`
+- `Descrição da falha (Logcat / Screenshot / Teste)`
+- `Correção aplicada (arquivo e linhas)`
+- `Resultado após reiniciar do zero`
+
+**Regra do Loop:**
+- Achou 1 ou mais falhas? $\rightarrow$ Corrija o código $\rightarrow$ Rode `./gradlew testDebugUnitTest connectedDebugAndroidTest installDebug` $\rightarrow$ Rode `adb shell pm clear <applicationId>` $\rightarrow$ **Recomece o Playtest desde a Tela Inicial**.
+- Só encerre o loop quando **uma rodada completa do começo ao fim passar com ZERO falhas** na Camada A (Emulador) e na Camada B (Bot das 10 Regiões até os Créditos).
+
+---
+
+## FASE 3 — ENTREGA FINAL QUANDO ZERAR
+
+Quando concluir a rodada limpa de ponta a ponta, me entregue:
+1. Resumo de todas as falhas reais que você encontrou jogando e como corrigiu cada uma.
+2. Resultado real dos testes executados (unitários, instrumentados, compilação APK e verificação no emulador).
+3. Lista do que está 100% jogável hoje e eventuais itens que ainda dependam de arte/áudio externo humano (ex.: gravação final de voz ou músicas originais).
+4. Caminho exato do `.apk` compilado em `app/build/outputs/apk/debug/`.
+
+**Comece agora pela FASE 0 verificando o projeto atual e o emulador.**
+```
+
+---
+
+### 3 dicas rápidas antes de enviar esse comando no seu PC
+
+1. **Abra o Emulador Android antes** (lá no Android Studio, clique em *Device Manager* $\rightarrow$ *Play* no seu aparelho virtual em modo **Landscape/Horizontal**), porque isso economiza vários passos para a IA e evita ela escolher um emulador errado.
+2. **Garanta que o `adb` está funcionando:** se a IA reclamar que `adb` não foi encontrado no terminal, diga apenas `"O adb fica na pasta AppData\Local\Android\Sdk\platform-tools, adicione ao PATH desta sessão"`.
+3. **Se você quiser testar primeiro só até a Região 1 (sem exigir as 10 regiões completas já implementadas):** caso você ainda não tenha criado os mapas e chefes das regiões 2 a 10 no código, na hora que a IA parar na Fase 0/1 ela vai acusar exatamente o que falta construir — e se você preferir, pode acrescentar no final do prompt: *"Se as Regiões 2 a 10 ainda não existirem no código, implemente a progressão completa delas antes de iniciar o Bot da Camada B."*

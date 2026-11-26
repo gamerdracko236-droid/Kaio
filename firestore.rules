@@ -1,0 +1,107 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isBoundedStringList(arr, maxLen) {
+      return arr is list && arr.size() <= maxLen && (arr.size() == 0 || arr[0] is string);
+    }
+
+    function isValidSaveSlot(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.slotLabel is string && data.slotLabel.size() >= 1 && data.slotLabel.size() <= 50 &&
+             data.heroName is string && data.heroName.size() >= 1 && data.heroName.size() <= 24 &&
+             data.hatStyle in ['VAQUEIRO', 'CANGACEIRO', 'BANDANA', 'SEM_CHAPEU'] &&
+             data.outfitStyle in ['GIBAO_COURO', 'MANTO_CHAMA', 'MANTO_AGUAS', 'MANTO_NOITE'] &&
+             data.bladeColor in ['SOLAR_NEGRA', 'BRASA_VIVA', 'TROVAO_DOURADO', 'AZUL_ENXURRADA', 'LUA_PRATA'] &&
+             data.activeStyle in ['CHAMA', 'TEMPESTADE', 'CAATINGA', 'AGUAS', 'LUA'] &&
+             data.level is int && data.level >= 1 && data.level <= 99 &&
+             data.xp is int && data.xp >= 0 && data.xp <= 9999999 &&
+             data.coins is int && data.coins >= 0 && data.coins <= 9999999 &&
+             data.currentChapter is int && data.currentChapter >= 1 && data.currentChapter <= 20 &&
+             data.currentRegionId is string && data.currentRegionId.size() >= 1 && data.currentRegionId.size() <= 40 &&
+             data.skillPoints is int && data.skillPoints >= 0 && data.skillPoints <= 999 &&
+             data.attackBonus is int && data.attackBonus >= 0 && data.attackBonus <= 100 &&
+             data.defenseBonus is int && data.defenseBonus >= 0 && data.defenseBonus <= 100 &&
+             data.energyBonus is int && data.energyBonus >= 0 && data.energyBonus <= 100 &&
+             data.weaponUpgrade is int && data.weaponUpgrade >= 1 && data.weaponUpgrade <= 10 &&
+             data.playTimeSeconds is int && data.playTimeSeconds >= 0 && data.playTimeSeconds <= 99999999 &&
+             isBoundedStringList(data.unlockedRegions, 15) &&
+             isBoundedStringList(data.completedQuests, 50) &&
+             isBoundedStringList(data.unlockedSkills, 30) &&
+             isBoundedStringList(data.unlockedAchievements, 30) &&
+             isBoundedStringList(data.inventoryEntries, 30);
+    }
+
+    match /users/{userId}/save_slots/{slotId} {
+      allow get: if isOwner(userId) && isValidId(slotId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(slotId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'slotLabel', 'heroName', 'hatStyle', 'outfitStyle',
+                         'bladeColor', 'activeStyle', 'level', 'xp', 'coins',
+                         'currentChapter', 'currentRegionId', 'skillPoints',
+                         'attackBonus', 'defenseBonus', 'energyBonus', 'weaponUpgrade',
+                         'playTimeSeconds', 'unlockedRegions', 'completedQuests',
+                         'unlockedSkills', 'unlockedAchievements', 'inventoryEntries',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'slotLabel', 'heroName', 'hatStyle', 'outfitStyle',
+                         'bladeColor', 'activeStyle', 'level', 'xp', 'coins',
+                         'currentChapter', 'currentRegionId', 'skillPoints',
+                         'attackBonus', 'defenseBonus', 'energyBonus', 'weaponUpgrade',
+                         'playTimeSeconds', 'unlockedRegions', 'completedQuests',
+                         'unlockedSkills', 'unlockedAchievements', 'inventoryEntries',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+                       incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+                       isValidSaveSlot(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(slotId) &&
+                       isValidSaveSlot(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'slotLabel', 'heroName', 'hatStyle', 'outfitStyle',
+                         'bladeColor', 'activeStyle', 'level', 'xp', 'coins',
+                         'currentChapter', 'currentRegionId', 'skillPoints',
+                         'attackBonus', 'defenseBonus', 'energyBonus', 'weaponUpgrade',
+                         'playTimeSeconds', 'unlockedRegions', 'completedQuests',
+                         'unlockedSkills', 'unlockedAchievements', 'inventoryEntries',
+                         'updatedAt'
+                       ]);
+
+      allow delete: if isOwner(userId) && isValidId(slotId);
+    }
+  }
+}

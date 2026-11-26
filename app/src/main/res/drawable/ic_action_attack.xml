@@ -1,0 +1,22 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Lâmina Solar inclinada em golpe -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M19.8,3.2 L16.2,3.8 L7.5,12.5 L9.8,14.8 L18.5,6.1 L19.8,3.2 Z" />
+    <!-- Guarda da lâmina -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5.8,11.8 L11.4,17.4 L10.0,18.8 L4.4,13.2 Z" />
+    <!-- Cabo -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6.2,16.0 L3.2,19.0 L4.6,20.4 L7.6,17.4 Z" />
+    <!-- Rastro de corte -->
+    <path
+        android:fillColor="#FFFFD166"
+        android:pathData="M4.0,7.5 C7.5,4.5 12.0,3.2 15.0,3.4 C11.8,4.6 8.2,6.4 5.2,9.2 Z" />
+</vector>

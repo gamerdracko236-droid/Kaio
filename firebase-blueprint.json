@@ -1,0 +1,148 @@
+{
+  "entities": {
+    "GameSaveSlot": {
+      "title": "GameSaveSlot",
+      "description": "Save state for Caçadores do Sertão including hero customization, RPG progression, unlocked regions, quests, inventory, and achievements.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase UID owning this save slot."
+        },
+        "slotLabel": {
+          "type": "string",
+          "description": "Display label for the save slot in Portuguese."
+        },
+        "heroName": {
+          "type": "string",
+          "description": "Customizable protagonist name."
+        },
+        "hatStyle": {
+          "type": "string",
+          "enum": ["VAQUEIRO", "CANGACEIRO", "BANDANA", "SEM_CHAPEU"]
+        },
+        "outfitStyle": {
+          "type": "string",
+          "enum": ["GIBAO_COURO", "MANTO_CHAMA", "MANTO_AGUAS", "MANTO_NOITE"]
+        },
+        "bladeColor": {
+          "type": "string",
+          "enum": ["SOLAR_NEGRA", "BRASA_VIVA", "TROVAO_DOURADO", "AZUL_ENXURRADA", "LUA_PRATA"]
+        },
+        "activeStyle": {
+          "type": "string",
+          "enum": ["CHAMA", "TEMPESTADE", "CAATINGA", "AGUAS", "LUA"]
+        },
+        "level": {
+          "type": "integer",
+          "description": "Hunter level (1 to 99)."
+        },
+        "xp": {
+          "type": "integer",
+          "description": "Current experience points."
+        },
+        "coins": {
+          "type": "integer",
+          "description": "Sertão coins (Patacas) for shop purchases and upgrades."
+        },
+        "currentChapter": {
+          "type": "integer",
+          "description": "Current story chapter (1 to 20)."
+        },
+        "currentRegionId": {
+          "type": "string",
+          "description": "Active region identifier."
+        },
+        "skillPoints": {
+          "type": "integer",
+          "description": "Available skill tree points."
+        },
+        "attackBonus": {
+          "type": "integer",
+          "description": "Attribute investment in attack."
+        },
+        "defenseBonus": {
+          "type": "integer",
+          "description": "Attribute investment in defense."
+        },
+        "energyBonus": {
+          "type": "integer",
+          "description": "Attribute investment in energy/stamina."
+        },
+        "weaponUpgrade": {
+          "type": "integer",
+          "description": "Solar blade temper level (1 to 10)."
+        },
+        "playTimeSeconds": {
+          "type": "integer",
+          "description": "Total campaign play time in seconds."
+        },
+        "unlockedRegions": {
+          "type": "array",
+          "description": "List of unlocked region IDs."
+        },
+        "completedQuests": {
+          "type": "array",
+          "description": "List of completed quest IDs."
+        },
+        "unlockedSkills": {
+          "type": "array",
+          "description": "List of unlocked skill IDs."
+        },
+        "unlockedAchievements": {
+          "type": "array",
+          "description": "List of unlocked achievement IDs."
+        },
+        "inventoryEntries": {
+          "type": "array",
+          "description": "Bounded item entries formatted as itemId:quantity."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the save slot was created (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last save (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "slotLabel",
+        "heroName",
+        "hatStyle",
+        "outfitStyle",
+        "bladeColor",
+        "activeStyle",
+        "level",
+        "xp",
+        "coins",
+        "currentChapter",
+        "currentRegionId",
+        "skillPoints",
+        "attackBonus",
+        "defenseBonus",
+        "energyBonus",
+        "weaponUpgrade",
+        "playTimeSeconds",
+        "unlockedRegions",
+        "completedQuests",
+        "unlockedSkills",
+        "unlockedAchievements",
+        "inventoryEntries",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/save_slots/{slotId}": {
+      "schema": {
+        "$ref": "#/entities/GameSaveSlot"
+      },
+      "description": "Stores automatic and manual RPG save slots isolated per authenticated user."
+    }
+  }
+}

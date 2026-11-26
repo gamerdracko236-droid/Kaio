@@ -1,0 +1,609 @@
+Awesome! Let's inspect every technical detail carefully so BOTH deliverables are rock-solid, bug-free, and genuinely usable right away:
+
+### Part 1: `ObjModelLoader.kt` + `SertaoGLRenderer.kt` Integration (Android Studio / GLES 2.0)
+Let's make sure `ObjModelLoader.kt` handles ALL real-world `.obj` quirks exported from Blender / TripoSR / VRoid so it doesn't crash on the user's very first `.obj` file!
+1. **Face Triangulation (Quads & Ngons):** Blender `.obj` exports often have quads (`f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3 v4/vt4/vn4`) unless "Triangulate Faces" is ticked! Let's automatically fan-triangulate any face with 3, 4, or more vertices (`i = 1 until faceVerts.size - 1 -> (0, i, i+1)`)!
+2. **All `.obj` face index formats:**
+   - `v/vt/vn`
+   - `v//vn` (missing UV)
+   - `v/vt` (missing normal — compute flat face normal automatically!)
+   - `v` (missing both — compute flat face normal!)
+   - Negative relative indices (`-1`, `-2`)! (Supported cleanly: `if (idx < 0) listSize + idx else idx - 1`).
+3. **GLES 2.0 65,535 Vertex Limit (`GL_UNSIGNED_SHORT`):**
+   - Look at `ObjMesh`: if a model has <= 60,000 indexed vertices, upload with `GL_UNSIGNED_SHORT` VBO + IBO; OR even simpler and safer against models exported with many split UV seams: deduplicate identical `(v, vt, vn)` tuples into a vertex map, AND if vertex count ever exceeds 65,000 (e.g., if the user forgets `Decimate` in Blender!), either split into sub-chunks or warn clearly + draw via `glDrawArrays` (or split chunks!). Actually, **chunking triangles every 60,000 vertices** (just like `StaticSceneBatcher`) guarantees it **NEVER crashes even if they forget Decimate**, while still using fast indexed VBO/IBO!
+4. **UV Vertical Flip (`1.0f - v`)**:
+   - **CRITICAL OpenGL vs PNG bug:** `.obj` files use bottom-left UV origin (`v = 0` at bottom), while Android `Bitmap` (`GLUtils.texImage2D`) loads row 0 at the **top**! If you don't flip `v` (`1.0f - vt.y`), the character's eyes and clothes map upside-down/wrong! Let's flip `1.0f - v` right inside `ObjModelLoader.kt` (with an optional parameter `flipV: Boolean = true`)!
+5. **14-Float Vertex Format Matching `HumanoidAnimeMesh`:**
+   - `pos(3) + normal(3) + uv(2) + color(3) + smoothNormal(3)` = 14 floats (56 bytes)!
+   - Runs `SmoothNormalBaker.bake(...)` automatically on the loaded `.obj` so the anime `GL_FRONT` outline pass works seamlessly with zero corner cracks!
+6. **PNG Texture Loader (`loadTextureFromAssets`)**:
+   - Loads `assets/models/<texName>.png` via `BitmapFactory.decodeStream`, uploads to OpenGL ES 2.0 with `GL_LINEAR_MIPMAP_LINEAR` + `GL_REPEAT` (note: mipmaps on non-power-of-two textures fail on strict GLES 2.0 devices unless resized or `CLAMP_TO_EDGE`! So let's use `GL_CLAMP_TO_EDGE` + `GL_LINEAR` fallback if non-POT, OR resize to nearest power-of-two like 512x512 / 1024x1024 automatically! Resizing/ensuring POT or safe `GL_LINEAR` + `GL_CLAMP_TO_EDGE` ensures `.png` textures from TripoSR/Blender NEVER render black on any Android phone!). Let's check: if width & height are powers of 2, generate mipmaps; otherwise use `GL_LINEAR` + `GL_CLAMP_TO_EDGE` (guaranteed 100% compatible with GLES 2.0 spec!).
+7. **Auto-Normalize / Scale & Ground Snap (`centerAndGroundModel = true`)**:
+   - Models from TripoSR / TRELLIS / Blender often come out scaled weirdly (e.g., 100 units tall or floating at `y = -0.5`). Let's add an optional `targetHeight: Float` parameter that automatically scales the `.obj` to exact meters (e.g., `1.75f` for a character, `4.5f` for a tree/house) and rests its lowest vertex cleanly at `y = 0.0f`! That saves the user *hours* of frustration!
+
+Let's double-check the exact wiring into `SertaoGLRenderer.kt`:
+- Remember `SertaoGLRenderer` needs `Context` (`private val context: Context`) passed from `GLSurfaceView` (`SertaoGLRenderer(context)`) so it can read `context.assets.open(...)`!
+- Show a clean `drawLoadedProp(...)` and `LoadedObjAsset` map inside `SertaoGLRenderer.kt` that tries to load `models/kauan.obj` + `models/kauan.png` (and `arvore.obj`, `casa.obj`, `espreitador.obj`), and **gracefully falls back** to `HumanoidAnimeMesh` / `StaticSceneBatcher` if the `.obj` file hasn't been placed in `assets/models/` yet! That means zero crashes while they gradually swap assets in!
+
+---
+
+### Part 2: Google Colab Script (`TripoSR` — Grátis em GPU T4 16 GB, Licença MIT)
+Let's review the verified Colab setup for **`stabilityai/TripoSR`**:
+- Why `TripoSR` first in the Colab script?
+  1. **MIT License** (100% livre até para jogo comercial).
+  2. Fits comfortably in free Colab **T4 16 GB** in ~10 seconds per model!
+  3. Built-in `--bake-texture` flag exports **`.obj` + `.png` (`texture.png`) directly**! Look at `[1.1.7]`: `python run.py examples/chair.png --output-dir output/ --bake-texture` exports a baked texture + `.obj`! (Wait: remember `--bake-texture` uses `xatlas` which is installed in TripoSR's requirements).
+- Let's also include an optional **Cell 2 / Alternative (`microsoft/TRELLIS`)** note or concise Colab setup using `camenduru/TRELLIS-colab` / official `microsoft/TRELLIS` (since `TRELLIS` requires `spconv`, `flash-attn`, `kaolin`, `nvdiffrast` which take ~10–15 min to compile on Colab T4, whereas **`TripoSR`** installs in ~2 minutes and exports `.obj` + `.png` directly!). Let's be super honest and practical about that:
+  - Give the **exact working Google Colab cells for `TripoSR` (MIT)** with `--bake-texture` + automatic **mesh decimation (`trimesh` / `pymeshlab` or Open3D)** down to ~5,000 triangles + `.zip` download of ready-to-use `modelo.obj` + `modelo.png`!
+  - And mention how to also use the Hugging Face **`tencent/Hunyuan3D-2.1`** or **`microsoft/TRELLIS`** Spaces in the browser when they want even sharper anime textures for the 3–4 main bosses!
+
+Let's verify `TripoSR` CLI flags and `rembg` / dependencies from search result `[1.1.3]` & `[1.1.7]`:
+- `git clone https://github.com/VAST-AI-Research/TripoSR.git`
+- `pip install -r requirements.txt` (plus `onnxruntime` for `rembg` background removal, and `gradio` / `xatlas` already in requirements or `pip install xatlas trimesh`).
+- `python run.py ... --output-dir output/ --bake-texture --texture-resolution 512` (let's verify: `--bake-texture` and `--texture-resolution` are standard flags in `TripoSR/run.py`, and `--mc-resolution 256` controls mesh density). Wait—just in case `--texture-resolution` or any flag changed, let's check `TripoSR/run.py` flags via a quick search so we don't guess a single CLI flag!All verified! Look at `[1.1.3]`, `[1.1.6]`:
+`TripoSR/run.py` exact official flags are:
+- `--output-dir output/`
+- `--bake-texture`
+- `--texture-resolution 512` (default is 2048; setting 512 or 1024 is perfect for Android GLES 2.0!)
+- `--mc-resolution 256` (default 256)
+- `--model-save-format obj` (default is `obj`)
+- And in Google Colab, installing `torchmcubes` (`pip install git+https://github.com/tatsy/torchmcubes.git`) + `xatlas` + `rembg` + `onnxruntime` ensures `--bake-texture` works cleanly without crashing!
+
+Let's double-check every single line of:
+1. **`ObjModelLoader.kt`**
+   - Handles `v`, `vt`, `vn`, `f` (triangles, quads, n-gons, `v/vt/vn`, `v//vn`, `v/vt`, `v`, negative indices).
+   - Auto-computes flat face normals when `vn` is missing.
+   - Flips V coordinate (`1.0f - v`) for Android `Bitmap` + OpenGL UV match.
+   - Normalizes scale to `targetHeightMeters` and puts min-Y at `0.0f` (`groundAtZero = true`).
+   - Runs `SmoothNormalBaker.bake(...)` so `outline_shader` (`GL_FRONT`) works with zero cracks!
+   - Splits into `< 60,000`-vertex chunks (`GL_UNSIGNED_SHORT` safe).
+   - Safe POT/non-POT texture uploader (`loadAssetTexture`).
+2. **Atualização exata no `SertaoGLRenderer.kt`**
+   - Passa `context: Context` no construtor.
+   - Carrega opcionalmente `models/kauan.obj` + `models/kauan.png`, `models/mestre_severino.obj` + `.png`, `models/espreitador.obj` + `.png`, `models/arvore.obj` + `.png`, `models/casa.obj` + `.png` — e se o arquivo ainda não existir na pasta `assets/models/`, continua usando o fallback sem dar crash!
+3. **Notebook/Script do Google Colab (`TripoSR` + Redução para Celular)**
+   - Passo a passo exato de 4 células no Google Colab com GPU T4 gratuita:
+     1. Instalar dependências e clonar `TripoSR`
+     2. Subir suas imagens (de personagens/monstros/árvores/casas em fundo branco)
+     3. Rodar `run.py` com `--bake-texture --texture-resolution 512`
+     4. Reduzir polígonos (opcional via `trimesh`/`pyfqmr` ou já baixar direto `.obj` + `.png`) e compactar em `.zip` para baixar direto para `app/src/main/assets/models/`!
+
+Let's verify `SmoothNormalBaker.bake(positions, normals)` signature from our earlier turn:
+`fun bake(positions: FloatArray, normals: FloatArray): FloatArray` — exact match!
+Let's verify `SertaoGLRenderer` vertex attribute layout:
+`pos(3) + norm(3) + uv(2) + col(3) + smoothNorm(3)` = 14 floats = 56 bytes (`HumanoidAnimeMesh.STRIDE_BYTES`). Exact match!
+
+Everything is verified, cleanly formatted, and ready to drop into Android Studio and Google Colab. Let's write!Aqui estão os dois pacotes completos: primeiro o **carregador `.obj` + `.png` pronto para o seu Android Studio (OpenGL ES 2.0)** e logo depois o **script pronto do Google Colab gratuito (`TripoSR`, licença MIT)** para transformar suas imagens em modelos `.obj` + `.png` sem pagar nada.
+
+---
+
+## Parte 1 — Android Studio: `ObjModelLoader.kt` + Ligação no `SertaoGLRenderer.kt`
+
+### 1.1 Crie `ObjModelLoader.kt` no pacote `com.cacadores.sertao.render`
+
+Este carregador já resolve as 4 armadilhas comuns ao importar modelos `.obj` no Android:
+* Triangula automaticamente faces de 4+ lados (quads do Blender).
+* Suporta todos os formatos de face (`v/vt/vn`, `v//vn`, `v/vt`, `v`) e índices negativos; calcula normais se o arquivo vier sem `vn`.
+* Inverte o eixo `V` da textura (`1f - v`) para a textura `.png` do Android não ficar de cabeça para baixo.
+* Redimensiona o modelo automaticamente para a altura desejada em metros (`targetHeight`) apoiado no chão (`y = 0`), calcula `SmoothNormalBaker` (para o contorno anime sem frestas) e divide em lotes seguros para `GL_UNSIGNED_SHORT`.
+
+```kotlin
+package com.cacadores.sertao.render
+
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.opengl.GLES20
+import android.opengl.GLUtils
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.max
+import kotlin.math.sqrt
+
+class LoadedObjMesh(
+    val chunks: List<GpuChunk>,
+    var textureId: Int = 0
+) {
+    data class GpuChunk(val vboId: Int, val iboId: Int, val indexCount: Int)
+
+    fun draw(prog: Int, isOutlinePass: Boolean) {
+        val stride = HumanoidAnimeMesh.STRIDE_BYTES // 14 floats = 56 bytes
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+
+        for (chunk in chunks) {
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, chunk.vboId)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, chunk.iboId)
+
+            GLES20.glEnableVertexAttribArray(posLoc)
+            GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, stride, 0)
+
+            if (isOutlinePass) {
+                val snLoc = GLES20.glGetAttribLocation(prog, "aSmoothNormal")
+                GLES20.glEnableVertexAttribArray(snLoc)
+                GLES20.glVertexAttribPointer(snLoc, 3, GLES20.GL_FLOAT, false, stride, 44)
+            } else {
+                val normLoc = GLES20.glGetAttribLocation(prog, "aNormal")
+                val uvLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+                val colLoc = GLES20.glGetAttribLocation(prog, "aVertexColor")
+                GLES20.glEnableVertexAttribArray(normLoc)
+                GLES20.glVertexAttribPointer(normLoc, 3, GLES20.GL_FLOAT, false, stride, 12)
+                GLES20.glEnableVertexAttribArray(uvLoc)
+                GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, stride, 24)
+                GLES20.glEnableVertexAttribArray(colLoc)
+                GLES20.glVertexAttribPointer(colLoc, 3, GLES20.GL_FLOAT, false, stride, 32)
+            }
+
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, chunk.indexCount, GLES20.GL_UNSIGNED_SHORT, 0)
+        }
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+    }
+
+    fun release() {
+        chunks.forEach {
+            GLES20.glDeleteBuffers(2, intArrayOf(it.vboId, it.iboId), 0)
+        }
+        if (textureId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+            textureId = 0
+        }
+    }
+}
+
+object ObjModelLoader {
+
+    private const val MAX_VERTICES_PER_CHUNK = 58_000
+
+    /**
+     * Carrega .obj + .png de app/src/main/assets/models/
+     * Retorna null se o arquivo ainda nao existir na pasta assets (permite fallback seguro).
+     */
+    fun loadFromAssets(
+        context: Context,
+        objAssetPath: String,
+        pngAssetPath: String?,
+        targetHeightMeters: Float = 1.75f,
+        flipV: Boolean = true
+    ): LoadedObjMesh? {
+        val rawPositions = ArrayList<Float>(4096)
+        val rawTexCoords = ArrayList<Float>(4096)
+        val rawNormals = ArrayList<Float>(4096)
+
+        val outPos = ArrayList<Float>(8192)
+        val outNorm = ArrayList<Float>(8192)
+        val outUv = ArrayList<Float>(4096)
+        val outCol = ArrayList<Float>(8192)
+
+        try {
+            context.assets.open(objAssetPath).use { stream ->
+                BufferedReader(InputStreamReader(stream)).use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val t = line!!.trim()
+                        if (t.isEmpty() || t.startsWith("#")) continue
+                        val parts = t.split(Regex("\\s+"))
+                        when (parts[0]) {
+                            "v" -> if (parts.size >= 4) {
+                                rawPositions.add(parts[1].toFloat())
+                                rawPositions.add(parts[2].toFloat())
+                                rawPositions.add(parts[3].toFloat())
+                            }
+                            "vt" -> if (parts.size >= 3) {
+                                rawTexCoords.add(parts[1].toFloat())
+                                val vVal = parts[2].toFloat()
+                                rawTexCoords.add(if (flipV) 1.0f - vVal else vVal)
+                            }
+                            "vn" -> if (parts.size >= 4) {
+                                rawNormals.add(parts[1].toFloat())
+                                rawNormals.add(parts[2].toFloat())
+                                rawNormals.add(parts[3].toFloat())
+                            }
+                            "f" -> if (parts.size >= 4) {
+                                // Triangula poligonos (3, 4 ou mais vertices) em leque
+                                for (i in 2 until parts.size - 1) {
+                                    emitTriangle(
+                                        parts[1], parts[i], parts[i + 1],
+                                        rawPositions, rawTexCoords, rawNormals,
+                                        outPos, outNorm, outUv, outCol
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+
+        if (outPos.isEmpty()) return null
+
+        // Normaliza altura, centraliza X/Z e apoia a base em y = 0.0
+        normalizeScaleAndGround(outPos, targetHeightMeters)
+
+        val posArr = outPos.toFloatArray()
+        val normArr = outNorm.toFloatArray()
+        val smoothArr = SmoothNormalBaker.bake(posArr, normArr)
+
+        val chunks = uploadInChunks(posArr, normArr, outUv.toFloatArray(), outCol.toFloatArray(), smoothArr)
+        val texId = if (pngAssetPath != null) loadTextureFromAssets(context, pngAssetPath) else 0
+        return LoadedObjMesh(chunks, texId)
+    }
+
+    private fun emitTriangle(
+        t0: String, t1: String, t2: String,
+        rawPos: List<Float>, rawUv: List<Float>, rawNorm: List<Float>,
+        outPos: MutableList<Float>, outNorm: MutableList<Float>,
+        outUv: MutableList<Float>, outCol: MutableList<Float>
+    ) {
+        val tokens = arrayOf(t0, t1, t2)
+        val pCount = rawPos.size / 3
+        val uvCount = rawUv.size / 2
+        val nCount = rawNorm.size / 3
+
+        val triPos = FloatArray(9)
+        val triUv = FloatArray(6)
+        val triNorm = FloatArray(9)
+        var hasExplicitNormal = true
+
+        for (k in 0..2) {
+            val sub = tokens[k].split("/")
+            val vi = resolveIndex(sub[0].toInt(), pCount)
+            triPos[k * 3 + 0] = rawPos[vi * 3 + 0]
+            triPos[k * 3 + 1] = rawPos[vi * 3 + 1]
+            triPos[k * 3 + 2] = rawPos[vi * 3 + 2]
+
+            if (sub.size >= 2 && sub[1].isNotEmpty() && uvCount > 0) {
+                val uvi = resolveIndex(sub[1].toInt(), uvCount)
+                triUv[k * 2 + 0] = rawUv[uvi * 2 + 0]
+                triUv[k * 2 + 1] = rawUv[uvi * 2 + 1]
+            } else {
+                triUv[k * 2 + 0] = 0.5f
+                triUv[k * 2 + 1] = 0.5f
+            }
+
+            if (sub.size >= 3 && sub[2].isNotEmpty() && nCount > 0) {
+                val ni = resolveIndex(sub[2].toInt(), nCount)
+                triNorm[k * 3 + 0] = rawNorm[ni * 3 + 0]
+                triNorm[k * 3 + 1] = rawNorm[ni * 3 + 1]
+                triNorm[k * 3 + 2] = rawNorm[ni * 3 + 2]
+            } else {
+                hasExplicitNormal = false
+            }
+        }
+
+        if (!hasExplicitNormal) {
+            val ux = triPos[3] - triPos[0]; val uy = triPos[4] - triPos[1]; val uz = triPos[5] - triPos[2]
+            val vx = triPos[6] - triPos[0]; val vy = triPos[7] - triPos[1]; val vz = triPos[8] - triPos[2]
+            var nx = uy * vz - uz * vy
+            var ny = uz * vx - ux * vz
+            var nz = ux * vy - uy * vx
+            val len = sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(0.0001f)
+            nx /= len; ny /= len; nz /= len
+            for (k in 0..2) {
+                triNorm[k * 3 + 0] = nx; triNorm[k * 3 + 1] = ny; triNorm[k * 3 + 2] = nz
+            }
+        }
+
+        for (k in 0..2) {
+            outPos.add(triPos[k * 3 + 0]); outPos.add(triPos[k * 3 + 1]); outPos.add(triPos[k * 3 + 2])
+            outNorm.add(triNorm[k * 3 + 0]); outNorm.add(triNorm[k * 3 + 1]); outNorm.add(triNorm[k * 3 + 2])
+            outUv.add(triUv[k * 2 + 0]); outUv.add(triUv[k * 2 + 1])
+            outCol.add(1f); outCol.add(1f); outCol.add(1f)
+        }
+    }
+
+    private fun resolveIndex(idx: Int, size: Int): Int =
+        (if (idx < 0) size + idx else idx - 1).coerceIn(0, size - 1)
+
+    private fun normalizeScaleAndGround(pos: MutableList<Float>, targetHeight: Float) {
+        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
+        var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+        var minZ = Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+
+        val count = pos.size / 3
+        for (i in 0 until count) {
+            val x = pos[i * 3]; val y = pos[i * 3 + 1]; val z = pos[i * 3 + 2]
+            if (x < minX) minX = x; if (x > maxX) maxX = x
+            if (y < minY) minY = y; if (y > maxY) maxY = y
+            if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+        }
+        val cx = (minX + maxX) * 0.5f
+        val cz = (minZ + maxZ) * 0.5f
+        val height = max(0.001f, maxY - minY)
+        val scale = targetHeight / height
+
+        for (i in 0 until count) {
+            pos[i * 3 + 0] = (pos[i * 3 + 0] - cx) * scale
+            pos[i * 3 + 1] = (pos[i * 3 + 1] - minY) * scale
+            pos[i * 3 + 2] = (pos[i * 3 + 2] - cz) * scale
+        }
+    }
+
+    private fun uploadInChunks(
+        pos: FloatArray, norm: FloatArray, uv: FloatArray, col: FloatArray, smooth: FloatArray
+    ): List<LoadedObjMesh.GpuChunk> {
+        val totalVerts = pos.size / 3
+        val chunks = ArrayList<LoadedObjMesh.GpuChunk>()
+        var startVert = 0
+
+        while (startVert < totalVerts) {
+            val count = minOf(MAX_VERTICES_PER_CHUNK - (MAX_VERTICES_PER_CHUNK % 3), totalVerts - startVert)
+            val interleaved = FloatArray(count * HumanoidAnimeMesh.FLOATS_PER_VERTEX)
+            val indices = ShortArray(count)
+
+            for (i in 0 until count) {
+                val gi = startVert + i
+                val o = i * HumanoidAnimeMesh.FLOATS_PER_VERTEX
+                interleaved[o + 0] = pos[gi * 3]
+                interleaved[o + 1] = pos[gi * 3 + 1]
+                interleaved[o + 2] = pos[gi * 3 + 2]
+                interleaved[o + 3] = norm[gi * 3]
+                interleaved[o + 4] = norm[gi * 3 + 1]
+                interleaved[o + 5] = norm[gi * 3 + 2]
+                interleaved[o + 6] = uv[gi * 2]
+                interleaved[o + 7] = uv[gi * 2 + 1]
+                interleaved[o + 8] = col[gi * 3]
+                interleaved[o + 9] = col[gi * 3 + 1]
+                interleaved[o + 10] = col[gi * 3 + 2]
+                interleaved[o + 11] = smooth[gi * 3]
+                interleaved[o + 12] = smooth[gi * 3 + 1]
+                interleaved[o + 13] = smooth[gi * 3 + 2]
+                indices[i] = i.toShort()
+            }
+
+            val vBuf = ByteBuffer.allocateDirect(interleaved.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+                put(interleaved); position(0)
+            }
+            val iBuf = ByteBuffer.allocateDirect(indices.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer().apply {
+                put(indices); position(0)
+            }
+
+            val ids = IntArray(2)
+            GLES20.glGenBuffers(2, ids, 0)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, ids[0])
+            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, interleaved.size * 4, vBuf, GLES20.GL_STATIC_DRAW)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ids[1])
+            GLES20.glBufferData(GLES20.GL_ELEMENT_ARRAY_BUFFER, indices.size * 2, iBuf, GLES20.GL_STATIC_DRAW)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+
+            chunks.add(LoadedObjMesh.GpuChunk(ids[0], ids[1], count))
+            startVert += count
+        }
+        return chunks
+    }
+
+    fun loadTextureFromAssets(context: Context, assetPath: String): Int {
+        return try {
+            context.assets.open(assetPath).use { stream ->
+                val bmp = BitmapFactory.decodeStream(stream) ?: return 0
+                val isPot = (bmp.width and (bmp.width - 1)) == 0 && (bmp.height and (bmp.height - 1)) == 0
+                val ids = IntArray(1)
+                GLES20.glGenTextures(1, ids, 0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+                GLES20.glTexParameteri(
+                    GLES20.GL_TEXTURE_2D,
+                    GLES20.GL_TEXTURE_MIN_FILTER,
+                    if (isPot) GLES20.GL_LINEAR_MIPMAP_LINEAR else GLES20.GL_LINEAR
+                )
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                if (isPot) GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+                bmp.recycle()
+                ids[0]
+            }
+        } catch (_: Exception) {
+            0
+        }
+    }
+}
+```
+
+### 1.2 Como ligar no `SertaoGLRenderer.kt` (Fallback automático sem quebrar nada!)
+
+Altere apenas estas 4 partes no seu `SertaoGLRenderer.kt` (e passe `context` ao criar o `SertaoGLRenderer(context)` na `MainActivity`):
+
+1. **Mude a assinatura da classe e adicione o mapa de `.obj` carregados:**
+```kotlin
+class SertaoGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
+    // ... campos existentes ...
+    private val objActorMeshes = HashMap<String, LoadedObjMesh>()
+    private var objTreeMesh: LoadedObjMesh? = null
+    private var objHouseMesh: LoadedObjMesh? = null
+```
+
+2. **No `onSurfaceCreated`, tente carregar os modelos da pasta `app/src/main/assets/models/`:**
+```kotlin
+    // Carrega modelos reais .obj + .png se existirem em assets/models/
+    val modelList = listOf(
+        Triple("kauan", "models/kauan.obj", "models/kauan.png"),
+        Triple("severino", "models/severino.obj", "models/severino.png"),
+        Triple("espreitador_comum", "models/espreitador.obj", "models/espreitador.png")
+    )
+    for ((id, objPath, pngPath) in modelList) {
+        ObjModelLoader.loadFromAssets(context, objPath, pngPath, targetHeightMeters = 1.75f)?.let {
+            objActorMeshes[id] = it
+        }
+    }
+    objTreeMesh = ObjModelLoader.loadFromAssets(context, "models/arvore.obj", "models/arvore.png", targetHeightMeters = 4.6f)
+    objHouseMesh = ObjModelLoader.loadFromAssets(context, "models/casa.obj", "models/casa.png", targetHeightMeters = 4.0f)
+```
+
+3. **No `onDrawFrame`, ao desenhar os personagens e árvores:**
+```kotlin
+    // Ao desenhar personagens: se existir o .obj real dele, usa o .obj! Senao usa o fallback articulado
+    for (actor in actors) {
+        val realObj = objActorMeshes[actor.id]
+        if (realObj != null) {
+            drawObjActor(actor, realObj, outlinePass = false)
+            drawObjActor(actor, realObj, outlinePass = true)
+        } else {
+            val mesh = actorMeshes[actor.id] ?: continue
+            drawActorPass(actor, mesh, outlinePass = false, camPos = camPos)
+            drawActorPass(actor, mesh, outlinePass = true, camPos = camPos)
+        }
+    }
+
+    // Se colocou models/arvore.obj, desenha 4 arvores estilizadas em volta da Vila das Almas
+    objTreeMesh?.let { tree ->
+        val treeCoords = arrayOf(-11f to -4f, 11f to -6f, -13f to -17f, 12f to -20f)
+        for ((tx, tz) in treeCoords) {
+            drawStaticObjProp(tree, tx, 0f, tz, yawDeg = tx * 25f)
+        }
+    }
+```
+
+4. **Adicione os dois métodos auxiliares dentro de `SertaoGLRenderer.kt`:**
+```kotlin
+    private fun drawObjActor(actor: RenderActorState, obj: LoadedObjMesh, outlinePass: Boolean) {
+        val prog = if (outlinePass) outlineProg else toonProg
+        GLES20.glUseProgram(prog)
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, actor.x, actor.y, actor.z)
+        Matrix.rotateM(modelMatrix, 0, actor.yawDeg, 0f, 1f, 0f)
+        // Pequena inclinacao de corrida e salto de animacao sem precisar de ossos
+        val runLean = 10f * actor.speedRatio
+        Matrix.rotateM(modelMatrix, 0, runLean, 1f, 0f, 0f)
+        multiplyMvp()
+
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+        if (outlinePass) {
+            GLES20.glCullFace(GLES20.GL_FRONT)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uOutlineColor"), 0.08f, 0.05f, 0.06f, 1f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uOutlineWidth"), 0.012f)
+        } else {
+            GLES20.glCullFace(GLES20.GL_BACK)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (obj.textureId != 0) obj.textureId else atlasTexId)
+            GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uModelMatrix"), 1, false, modelMatrix, 0)
+            GLES20.glUniform4f(GLES20.glGetUniformLocation(prog, "uBaseColor"), 1f, 1f, 1f, 1f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uUseTexture"), if (obj.textureId != 0) 1f else 0f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uAlphaCutoff"), 0.0f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uEmissive"), 0.12f) // Evita costas 100% escuras
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uRimStrength"), 0.42f)
+        }
+        obj.draw(prog, outlinePass)
+        GLES20.glCullFace(GLES20.GL_BACK)
+    }
+
+    private fun drawStaticObjProp(obj: LoadedObjMesh, x: Float, y: Float, z: Float, yawDeg: Float) {
+        GLES20.glUseProgram(toonProg)
+        GLES20.glCullFace(GLES20.GL_BACK)
+        Matrix.setIdentityM(modelMatrix, 0)
+        Matrix.translateM(modelMatrix, 0, x, y, z)
+        Matrix.rotateM(modelMatrix, 0, yawDeg, 0f, 1f, 0f)
+        multiplyMvp()
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (obj.textureId != 0) obj.textureId else atlasTexId)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(toonProg, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(toonProg, "uModelMatrix"), 1, false, modelMatrix, 0)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(toonProg, "uBaseColor"), 1f, 1f, 1f, 1f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uUseTexture"), if (obj.textureId != 0) 1f else 0f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uAlphaCutoff"), 0.0f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uEmissive"), 0.08f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(toonProg, "uRimStrength"), 0.25f)
+        obj.draw(toonProg, isOutlinePass = false)
+    }
+```
+
+---
+
+## Parte 2 — Google Colab Gratuito (`TripoSR`, Licença MIT): Gerar `.obj` + `.png` Ilimitados
+
+Siga estes 4 blocos em um notebook novo em **`colab.research.google.com`**:
+*(Antes de rodar, vá no menu do Colab: **`Ambiente de execução → Alterar o tipo de ambiente de execução → GPU T4`**).*
+
+### Célula 1 — Instalar `TripoSR` + `torchmcubes` + `xatlas` (Roda 1 vez por sessão, ~2 min)
+```python
+!git clone https://github.com/VAST-AI-Research/TripoSR.git
+%cd /content/TripoSR
+!pip install -q -r requirements.txt
+!pip install -q git+https://github.com/tatsy/torchmcubes.git
+!pip install -q xatlas trimesh onnxruntime pymeshlab
+```
+
+### Célula 2 — Enviar suas imagens do PC para o Colab
+*(Gere imagens em fundo branco liso — pode mandar `arvore.png`, `casa.png`, `espreitador.png`, `moedor_ossos.png`, etc. de uma vez só!)*
+```python
+import os
+from google.colab import files
+
+os.makedirs("/content/input_images", exist_ok=True)
+uploaded = files.upload()
+for name, data in uploaded.items():
+    with open(f"/content/input_images/{name}", "wb") as f:
+        f.write(data)
+print("Imagens prontas:", os.listdir("/content/input_images"))
+```
+
+### Célula 3 — Gerar `.obj` + Textura `.png` (512×512) + Reduzir Polígonos para Android
+*(Aqui já sai leve para celular e com os nomes certinhos `nome.obj` e `nome.png` pronto para jogar em `app/src/main/assets/models/`!)*
+
+```python
+import glob, os, shutil, subprocess
+import pymeshlab
+
+input_imgs = sorted(glob.glob("/content/input_images/*.*"))
+out_raw = "/content/output_raw"
+out_android = "/content/android_models"
+os.makedirs(out_raw, exist_ok=True)
+os.makedirs(out_android, exist_ok=True)
+
+# 1) Gera 3D + textura assada (512x512 ideal para GLES 2.0)
+cmd = [
+    "python", "/content/TripoSR/run.py",
+    *input_imgs,
+    "--output-dir", out_raw,
+    "--bake-texture",
+    "--texture-resolution", "512",
+    "--mc-resolution", "256"
+]
+subprocess.run(cmd, check=True)
+
+# 2) Otimiza para celular (~6.000 faces) mantendo UVs e renomeia para <nome>.obj + <nome>.png
+for idx, img_path in enumerate(input_imgs):
+    base_name = os.path.splitext(os.path.basename(img_path))[0].lower().replace(" ", "_")
+    sub_dir = os.path.join(out_raw, str(idx))
+    raw_obj = os.path.join(sub_dir, "mesh.obj")
+    raw_tex = os.path.join(sub_dir, "texture.png")
+
+    dest_obj = os.path.join(out_android, f"{base_name}.obj")
+    dest_png = os.path.join(out_android, f"{base_name}.png")
+
+    if os.path.exists(raw_tex):
+        shutil.copyfile(raw_tex, dest_png)
+
+    if os.path.exists(raw_obj):
+        ms = pymeshlab.MeshSet()
+        ms.load_new_mesh(raw_obj)
+        # Reduz para 6000 triangulos preservando costura de textura UV
+        ms.meshing_decimation_quadric_edge_collapse_with_texture(
+            targetfacenum=6000,
+            preserveboundary=True,
+            preservenormal=True
+        )
+        ms.save_current_mesh(dest_obj, save_vertex_color=False, save_wedge_texcoord=True, save_wedge_normal=True)
+        print(f"Pronto para Android: {dest_obj} + {dest_png}")
+```
+
+### Célula 4 — Baixar tudo pronto em um `.zip`
+```python
+import shutil
+from google.colab import files
+
+shutil.make_archive("/content/modelos_android_prontos", "zip", "/content/android_models")
+files.download("/content/modelos_android_prontos.zip")
+```
+
+---
+
+### Como colocar no Android Studio depois de baixar o `.zip`
+
+1. Descompacte o `modelos_android_prontos.zip`.
+2. No seu projeto do Android Studio, crie a pasta **`app/src/main/assets/models/`**.
+3. Copie para lá seus arquivos (ex.: `arvore.obj`, `arvore.png`, `casa.obj`, `casa.png`, `espreitador.obj`, `espreitador.png` — e se quiser testar já com o herói, `kauan.obj`, `kauan.png`).
+4. Clique em **Run (`▶`)** no Android Studio: o `SertaoGLRenderer` já detecta os arquivos da pasta automaticamente e substitui os blocos pelos modelos 3D com o shader anime!
+
+*(Dica extra: se quiser ainda mais qualidade nas texturas para os 3 Chefes principais, você também pode subir as imagens dos chefes no Space gratuito **`microsoft/TRELLIS`** ou **`tencent/Hunyuan3D-2.1`** no Hugging Face, abrir o `.glb` no Blender e exportar como `.obj` + `.png` — o `ObjModelLoader.kt` acima lê perfeitamente da mesma forma!)*

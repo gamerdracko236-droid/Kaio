@@ -1,0 +1,6 @@
+{
+  "name": "Caçadores do Sertão",
+  "description": "RPG de ação 3D em português brasileiro ambientado no sertão nordestino, com combate em tempo real, 5 estilos de luta, 10 regiões e progresso salvo na nuvem.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
